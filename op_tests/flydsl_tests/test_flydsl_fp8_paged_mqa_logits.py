@@ -24,6 +24,19 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
+
+# The hand-written HIP kernel (aiter/ops/mqa_logits.py). It is narrower than the
+# FlyDSL one -- gfx950, nh=32/hd=128, KVBlockSize in {1, 64}, no preshuffle -- so it
+# joins a case only when `_hip_ok` says it can run it, and the sweep is unchanged
+# otherwise.
+try:
+    from aiter.ops.mqa_logits import fp8_paged_mqa_logits as hip_paged_logits
+    from aiter.ops.mqa_logits import is_supported as hip_supported
+except ImportError:
+    hip_paged_logits = None
+
+    def hip_supported(num_heads, head_dim):
+        return False
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -35,6 +48,20 @@ DTYPE_MAP = {"fnuz": _E4M3_NATIVE, "fn": torch.float8_e4m3fn}
 
 REF_CHUNK_K = 256
 REF_WAVE_PER_EU = 2
+
+
+def _hip_ok(heads, head_dim, block_size, preshuffle):
+    """Whether the HIP kernel covers this case.
+
+    KVBlockSize is a compile-time constant there, instantiated for the two block
+    sizes the indexer actually uses, and each is tied to one cache layout -- the
+    same pairing production uses: KVBlockSize=1 reads the plain co-packed cache,
+    KVBlockSize=64 reads the ``shuffle_weight(layout=(16,16))`` one. The other two
+    combinations are not a supported input, so they are skipped rather than graded.
+    """
+    if hip_paged_logits is None or not hip_supported(heads, head_dim):
+        return False
+    return (block_size == 1 and not preshuffle) or (block_size == 64 and preshuffle)
 
 
 def calc_diff(x, y):
@@ -236,6 +263,7 @@ def _verify_paged_mqa_logits(
     inp,
     batch_size,
     next_n,
+    heads,
     head_dim,
     split_kv,
     block_size,
@@ -293,7 +321,43 @@ def _verify_paged_mqa_logits(
             msg="flydsl paged fp8_mqa_logits",
             printLog=False,
         )
-    return err, kv_cache_kernel, out
+    hip_err = float("nan")
+    if _hip_ok(heads, head_dim, block_size, preshuffle):
+        # Same contract as the other two: the kernel writes only the causal window,
+        # so the -inf outside it comes from this buffer's fill.
+        hip_out = torch.full(
+            (batch_size * next_n, inp.max_model_len),
+            float("-inf"),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        with torch.inference_mode():
+            got = hip_paged_logits(
+                inp.q_fp8,
+                kv_cache_kernel,
+                inp.weights,
+                inp.context_lens,
+                inp.block_tables,
+                inp.max_model_len,
+                out=hip_out,
+            )
+        got_mask = got == float("-inf")
+        assert torch.equal(got_mask, ref_mask), "hip paged: -inf mask mismatch"
+        hip_err = 0.0
+        if not ref_mask.all():
+            diff = calc_diff(got.masked_fill(got_mask, 0), ref.masked_fill(ref_mask, 0))
+            assert diff < 1e-3, f"hip paged calc_diff={diff}"
+            hip_err = diff.item()
+            checkAllclose(
+                ref.masked_fill(ref_mask, 0).to(dtypes.fp32),
+                got.masked_fill(got_mask, 0).to(dtypes.fp32),
+                rtol=1e-2,
+                atol=5.0,
+                msg="hip paged fp8_mqa_logits",
+                printLog=False,
+            )
+
+    return err, hip_err, kv_cache_kernel, out
 
 
 @benchmark()
@@ -335,6 +399,32 @@ def _bench_flydsl_paged_kernel(
     return {"flydsl us": float(us)}
 
 
+@benchmark()
+def _bench_hip_paged_kernel(
+    q_fp8,
+    kv_cache_fp8,
+    weights,
+    out,
+    context_lens,
+    block_tables,
+    max_model_len,
+):
+    def fn():
+        return hip_paged_logits(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            out=out,
+        )
+
+    with torch.inference_mode():
+        _, us = run_perftest(fn)
+    return {"hip us": float(us)}
+
+
 def test_fp8_paged_mqa_logits(
     batch_size,
     next_n,
@@ -358,10 +448,11 @@ def test_fp8_paged_mqa_logits(
         DTYPE_MAP[q_dtype],
         block_size=block_size,
     )
-    err, kv_cache_kernel, out = _verify_paged_mqa_logits(
+    err, hip_err, kv_cache_kernel, out = _verify_paged_mqa_logits(
         inp,
         batch_size,
         next_n,
+        heads,
         head_dim,
         split_kv,
         block_size,
@@ -377,6 +468,7 @@ def test_fp8_paged_mqa_logits(
         "variant": variant or "default",
         "chunk_k": chunk_k,
         "flydsl err": err,
+        "hip err": hip_err,
     }
     if not bench:
         return ret
@@ -429,6 +521,27 @@ def test_fp8_paged_mqa_logits(
             _, ref_us = run_perftest(fn_ref)
         ret["gluon us"] = float(ref_us)
 
+    if _hip_ok(heads, head_dim, block_size, preshuffle):
+        hip_out = torch.full(
+            (batch_size * next_n, inp.max_model_len),
+            float("-inf"),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        ret.update(
+            _bench_hip_paged_kernel(
+                inp.q_fp8,
+                kv_cache_kernel,
+                inp.weights,
+                hip_out,
+                inp.context_lens,
+                inp.block_tables,
+                inp.max_model_len,
+            )
+        )
+        # >1 means the hand-written HIP kernel is the faster of the two.
+        ret["hip/flydsl"] = ret["flydsl us"] / ret["hip us"]
+
     return ret
 
 
@@ -440,7 +553,9 @@ _BASE = {
     "avg_kv_length": 1024,
     "q_dtype": "fnuz",
 }
-_SHAPES = [(64, 64), (64, 128), (128, 64), (128, 128)]
+# (32, 128) is the shipped GLM-5-FP8 indexer shape and the only one the HIP
+# kernel covers, so the sweep has to reach it.
+_SHAPES = [(32, 128), (64, 64), (64, 128), (128, 64), (128, 128)]
 _AXES = (
     "batch_size",
     "next_n",
@@ -466,6 +581,23 @@ def default_cases():
             cases.append(
                 _c(heads=heads, head_dim=head_dim, block_size=kvb, preshuffle=True)
             )
+    # The HIP kernel's two supported layouts, across batch/next_n and a long context.
+    for bs, nn in ((1, 1), (2, 2), (8, 1)):
+        cases.append(_c(heads=32, head_dim=128, batch_size=bs, next_n=nn, block_size=1))
+        cases.append(
+            _c(
+                heads=32,
+                head_dim=128,
+                batch_size=bs,
+                next_n=nn,
+                block_size=64,
+                preshuffle=True,
+            )
+        )
+    cases.append(_c(heads=32, head_dim=128, avg_kv_length=8192, block_size=1))
+    cases.append(
+        _c(heads=32, head_dim=128, avg_kv_length=8192, block_size=64, preshuffle=True)
+    )
     cases += [_c(batch_size=b, next_n=n) for b, n in ((1, 1), (1, 2), (4, 2), (8, 1))]
     cases += [_c(avg_kv_length=kv) for kv in (128, 8192)]
     cases += [_c(split_kv=sk) for sk in (1, 4)]
@@ -507,14 +639,14 @@ def exhaustive_cases():
     ]
 
 
-def gluon_ab_shapes():
-    H, D = 64, 128
+def gluon_ab_shapes(heads=64):
+    D = 128
     shapes = []
     for B in (1, 4, 16, 64, 128):
         for avg_kv in (16384, 32768, 65536):
-            shapes.append((B, 2, H, D, avg_kv))
+            shapes.append((B, 2, heads, D, avg_kv))
     for B in (1, 16, 128):
-        shapes.append((B, 1, H, D, 32768))
+        shapes.append((B, 1, heads, D, 32768))
     return shapes
 
 
@@ -531,10 +663,11 @@ def run_profile(args):
         var_ratio=args.var_ratio,
         pool_blocks=args.pool_blocks,
     )
-    err, kv_cache_kernel, out = _verify_paged_mqa_logits(
+    err, _hip_err, kv_cache_kernel, out = _verify_paged_mqa_logits(
         inp,
         args.batch,
         args.next_n,
+        args.heads,
         args.head_dim,
         args.split_kv,
         args.kv_block_size,
@@ -587,7 +720,7 @@ def run_profile(args):
 
 def run_gluon_ab(args):
     rows = []
-    for B, nn, H, D, kv_len in gluon_ab_shapes():
+    for B, nn, H, D, kv_len in gluon_ab_shapes(args.heads):
         ret = test_fp8_paged_mqa_logits(
             batch_size=B,
             next_n=nn,
@@ -601,9 +734,15 @@ def run_gluon_ab(args):
         )
         fly_us = ret["flydsl us"]
         ref_us = ret.get("gluon us", float("nan"))
+        hip_us = ret.get("hip us", float("nan"))
         rows.append(
             {
                 **ret,
+                "hip/ref": (
+                    hip_us / ref_us
+                    if not math.isnan(hip_us) and not math.isnan(ref_us) and ref_us > 0
+                    else float("nan")
+                ),
                 "B": B,
                 "nn": nn,
                 "avg_kv": kv_len,
@@ -614,9 +753,13 @@ def run_gluon_ab(args):
                 ),
             }
         )
+        hip_col = "" if math.isnan(hip_us) else (
+            f" hip={hip_us:.1f}us hip/ref={rows[-1]['hip/ref']:.2f}x"
+            f" hip/fly={hip_us / fly_us:.2f}x"
+        )
         print(
             f"B={B} nn={nn} kv={kv_len} fly={fly_us:.1f}us gluon={ref_us:.1f}us "
-            f"fly/ref={rows[-1]['fly/ref']:.2f}x err={ret['flydsl err']:.2e}",
+            f"fly/ref={rows[-1]['fly/ref']:.2f}x{hip_col} err={ret['flydsl err']:.2e}",
             flush=True,
         )
     df = pd.DataFrame(rows)

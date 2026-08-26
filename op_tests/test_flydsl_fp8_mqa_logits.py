@@ -56,6 +56,18 @@ try:
 except ImportError:
     flydsl_fp8_mqa_logits = None
 
+# The hand-written HIP kernel (aiter/ops/mqa_logits.py). gfx950-only and fixed at
+# nh=32/hd=128, so it joins the sweep only on the cases it can actually run --
+# `hip_supported` is what gates that, per case, in `_candidates`.
+try:
+    from aiter.ops.mqa_logits import fp8_mqa_logits as hip_logits
+    from aiter.ops.mqa_logits import is_supported as hip_supported
+except ImportError:
+    hip_logits = None
+
+    def hip_supported(num_heads, head_dim):
+        return False
+
 # Bench timing knobs, set from argv in main(), read by _time_us.
 BENCH_WARMUP = 10
 BENCH_SAMPLES = 20
@@ -190,7 +202,7 @@ def _make_inputs(s_q, s_k, num_heads, head_dim, q_dtype, kv_dtype, window):
     return Inputs(q, kv, q_fp8, kv_fp8, scales, weights, ks, ke)
 
 
-def _candidates(inp, kv_dtype, clean_logits):
+def _candidates(inp, kv_dtype, clean_logits, num_heads, head_dim):
     candidates = {
         "flydsl": lambda: flydsl_fp8_mqa_logits(
             inp.q_fp8, inp.kv_fp8, inp.scales, inp.weights, inp.ks, inp.ke, clean_logits
@@ -200,6 +212,26 @@ def _candidates(inp, kv_dtype, clean_logits):
         candidates["triton"] = lambda: triton_logits(
             inp.q_fp8, inp.kv_fp8, inp.scales, inp.weights, inp.ks, inp.ke, clean_logits
         )
+    if hip_logits is not None and hip_supported(num_heads, head_dim):
+        # The output is allocated here rather than inside the kernel so that
+        # `_fill_output_with_nan` can intercept it -- otherwise the C++ side would
+        # allocate and the mask check would be graded against allocator leftovers.
+        s_q, s_k = inp.weights.shape[0], inp.kv_fp8.shape[0]
+
+        def _hip():
+            out = torch.empty((s_q, s_k), dtype=torch.float32, device="cuda")
+            return hip_logits(
+                inp.q_fp8,
+                inp.kv_fp8,
+                inp.scales,
+                inp.weights,
+                inp.ks,
+                inp.ke,
+                clean_logits=clean_logits,
+                out=out,
+            )
+
+        candidates["hip"] = _hip
     return candidates
 
 
@@ -229,10 +261,12 @@ def _grade(name, fn, inp, ref, ref_mask, s_q, s_k, clean_logits, tag):
     # the epilogue writes every in-window position.
     #
     # Applied to triton too where it essentially does nothing since its launcher
-    # still pre-fills with torch.full when clean_logits=True.
+    # still pre-fills with torch.full when clean_logits=True. The HIP kernel
+    # allocates its output inside C++, so torch.empty is never called for it and
+    # the interception simply does not apply -- hence the flydsl-only assert.
     with torch.inference_mode(), _fill_output_with_nan(s_q, s_k) as nan_filled:
         out = fn()
-    if name == "flydsl" and not nan_filled:
+    if name in ("flydsl", "hip") and not nan_filled:
         raise AssertionError(f"{name}: output buffer was not intercepted [{tag}]")
 
     out = _rehydrate(out, inp.ks, inp.ke, s_q, s_k, clean_logits)
@@ -301,7 +335,9 @@ def verify_fp8_mqa_logits(
     ref_mask = ref == float("-inf")
 
     ret = {"gfx": get_gfx(), "status": "ok"}
-    for name, fn in _candidates(inp, kv_dtype, clean_logits).items():
+    for name, fn in _candidates(
+        inp, kv_dtype, clean_logits, num_heads, head_dim
+    ).items():
         err, rel = _grade(name, fn, inp, ref, ref_mask, s_q, s_k, clean_logits, tag)
         ret[f"{name} err"] = err
         ret[f"{name} rel"] = rel
@@ -411,7 +447,9 @@ def bench_fp8_mqa_logits(
 
     ret = {"gfx": get_gfx(), "status": "ok"}
     times = {}
-    for name, fn in _candidates(inp, kv_dtype, clean_logits).items():
+    for name, fn in _candidates(
+        inp, kv_dtype, clean_logits, num_heads, head_dim
+    ).items():
         err, rel = _grade(name, fn, inp, ref, ref_mask, s_q, s_k, clean_logits, tag)
         us = _time_us(name, fn, tag)
         times[name] = us
@@ -425,9 +463,13 @@ def bench_fp8_mqa_logits(
         ret[f"{name} err"] = err
         ret[f"{name} rel"] = rel
 
-    # Perf ratio straight off the runtimes rather than off TFLOPS.
+    # Perf ratios straight off the runtimes rather than off TFLOPS.
     ret["speedup"] = (
         times["triton"] / times["flydsl"] if "triton" in times else float("nan")
+    )
+    # >1 means the hand-written HIP kernel is the faster of the two.
+    ret["hip/flydsl"] = (
+        times["flydsl"] / times["hip"] if "hip" in times else float("nan")
     )
 
     return ret
@@ -438,8 +480,8 @@ Case = namedtuple(
 )
 
 
-def _log_speedup(ratios):
-    """Headline FlyDSL-over-Triton figure for a bench sweep.
+def _log_speedup(ratios, fast, slow):
+    """Headline `fast`-over-`slow` figure for a bench sweep.
 
     Geometric mean, because these are ratios: an arithmetic mean over a sweep
     spanning 0.13x to 70x would just report the widest win.
@@ -449,13 +491,16 @@ def _log_speedup(ratios):
     if r.empty:
         return
     aiter.logger.info(
-        "fp8_mqa_logits bench: FlyDSL speedup over Triton on %d of %d cases: "
-        "geomean=%.2fx min=%.2fx max=%.2fx, FlyDSL faster on %d (>1 is faster)",
+        "fp8_mqa_logits bench: %s speedup over %s on %d of %d cases: "
+        "geomean=%.2fx min=%.2fx max=%.2fx, %s faster on %d (>1 is faster)",
+        fast,
+        slow,
         len(r),
         len(ratios),
         float(np.exp(np.log(r).mean())),
         r.min(),
         r.max(),
+        fast,
         int(r.gt(1).sum()),
     )
 
@@ -584,7 +629,7 @@ def main():
             (1024, 1000),
         ],
     )
-    parser.add_argument("--num-heads", type=int, nargs="*", default=[64, 128])
+    parser.add_argument("--num-heads", type=int, nargs="*", default=[32, 64, 128])
     parser.add_argument("--head-dim", type=int, nargs="*", default=[64, 128])
     parser.add_argument(
         "--q-dtype",
@@ -665,7 +710,9 @@ def main():
             df.to_markdown(index=False),
         )
         if "speedup" in df:
-            _log_speedup(df["speedup"])
+            _log_speedup(df["speedup"], "FlyDSL", "Triton")
+        if "hip/flydsl" in df:
+            _log_speedup(df["hip/flydsl"], "HIP", "FlyDSL")
 
     total = len(cases) * len(scenarios)
     if failures:
