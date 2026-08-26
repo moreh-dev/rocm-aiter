@@ -490,7 +490,10 @@ def test_fp8_paged_mqa_logits(
         )
     )
 
-    if block_size == 1 and not preshuffle:
+    # The Gluon kernel handles the preshuffled layout too, so time it on whatever
+    # (KVBlockSize, Preshuffle) pair this case built -- otherwise the A/B has no
+    # production baseline outside KVBlockSize=1.
+    if True:
         from aiter.ops.triton.attention.pa_mqa_logits import (
             deepgemm_fp8_paged_mqa_logits,
         )
@@ -505,15 +508,15 @@ def test_fp8_paged_mqa_logits(
         def fn_ref():
             return deepgemm_fp8_paged_mqa_logits(
                 inp.q_fp8,
-                inp.kv_cache_fp8,
+                kv_cache_kernel,
                 inp.weights,
                 out_ref,
                 inp.context_lens,
                 inp.block_tables,
                 inp.max_model_len,
                 ChunkK=REF_CHUNK_K,
-                Preshuffle=False,
-                KVBlockSize=1,
+                Preshuffle=preshuffle,
+                KVBlockSize=block_size,
                 WavePerEU=REF_WAVE_PER_EU,
             )
 
@@ -728,8 +731,8 @@ def run_gluon_ab(args):
             head_dim=D,
             avg_kv_length=kv_len,
             q_dtype="fnuz",
-            block_size=1,
-            preshuffle=False,
+            block_size=args.kv_block_size,
+            preshuffle=args.preshuffle,
             bench=True,
         )
         fly_us = ret["flydsl us"]
