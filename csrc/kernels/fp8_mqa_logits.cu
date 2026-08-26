@@ -366,8 +366,8 @@ torch::Tensor fp8_mqa_logits(
     int64_t num_warps,
     int64_t TotalCuCount,
     bool clean_logits,
-    bool unroll2,
-    bool reverse_rows,
+    int64_t Unroll2,
+    int64_t ReverseRows,
     std::optional<torch::Tensor> out
 ) {
     const int M = q_fp8.size(0);
@@ -383,6 +383,8 @@ torch::Tensor fp8_mqa_logits(
     int block_m    = static_cast<int>(BlockM);
     int split_n    = static_cast<int>(SplitN);
     int num_warps_ = static_cast<int>(num_warps);
+    bool unroll2   = Unroll2     > 0;
+    bool rev       = ReverseRows > 0;
 
     // ---- autotune (block_m, num_warps, split_n) ----
     // block_m rows share one K stream, at 32 VGPR per row (16 Q + 16 W). Unlike the
@@ -391,11 +393,33 @@ torch::Tensor fp8_mqa_logits(
     // per-row K range is long, and only backs off when the ranges are short enough
     // that the prologue and occupancy dominate. N is the proxy for that range (for a
     // single request the average row scans ~N/2).
-    // block_m=4 won every shape in the sweep: two row-pairs, so the paired-row
-    // reduction always has both halves busy, and 4*32=128 VGPR of Q+W still leaves
-    // room for the accumulator and the K tile.
+    // block_m=4 won 9 of 12 shapes: two row-pairs, so the paired-row reduction
+    // always has both halves busy, and 4*32=128 VGPR of Q+W still leaves room for
+    // the accumulator and the K tile. block_m=8 is not an option -- it needs 256
+    // VGPR and spills 113.
+    // Refit against a 12-shape sweep (bench + deploy configs), 2026-08-26.
+    //
+    // reverse_rows is the only knob that moved: on for N > 2048, worth +1% to
+    // +7% there and free -- it only reorders block dispatch, costing no register
+    // and no instruction in the loop. Under causal masking a row group's work
+    // grows with m, so in natural order the longest-running blocks are
+    // dispatched LAST and become the tail; reversing starts them first and lets
+    // the short ones fill in behind.
+    //
+    // Everything else stayed. The sweep's per-shape winners suggested num_warps=2
+    // and unroll2 for N <= 2048, but those values only win in combination with a
+    // block_m the two short shapes disagree on: measured pairwise, num_warps=2 is
+    // +2% at N=1024 and -30% at N=2048. No setting beats the current one on both,
+    // so the short-window branch is left alone.
+    //
+    // The multi-request shapes want num_warps=2 where the single-request shape of
+    // the SAME (M, N) wants 8 -- the difference is in cu_seqlen_ks/ke, which live
+    // on the device. A host heuristic keyed on (M, N) cannot separate them; that
+    // gain needs the caller to pass num_warps explicitly.
     if (block_m    <= 0) block_m    = 4;
     if (num_warps_ <= 0) num_warps_ = (N <= 2048) ? 4 : 8;
+    if (Unroll2     < 0) unroll2    = false;
+    if (ReverseRows < 0) rev        = (N > 2048);
     if (split_n    <= 0) {
         // Enough blocks to fill the machine: aim for ~2 workgroups per CU.
         const int row_blocks = CDIV_(M, block_m);
@@ -432,7 +456,7 @@ torch::Tensor fp8_mqa_logits(
         cu_seqlen_ks.data_ptr<int>(),
         cu_seqlen_ke.data_ptr<int>(),
         out_logits.data_ptr<float>(),
-        M, N, block_m, split_n, num_warps_, clean_logits, unroll2, reverse_rows,
+        M, N, block_m, split_n, num_warps_, clean_logits, unroll2, rev,
         stream);
 
     return out_logits;

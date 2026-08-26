@@ -38,8 +38,8 @@ torch::Tensor fp8_mqa_logits(torch::Tensor q_fp8,        // [M, 32, 128] fp8
                                    int64_t num_warps,
                                    int64_t TotalCuCount,
                                    bool clean_logits,
-                                   bool unroll2,
-                                   bool reverse_rows,
+                                   int64_t Unroll2,
+                                   int64_t ReverseRows,
                                    std::optional<torch::Tensor> out);
 
 // Writes into `out` when given (and returns it), otherwise allocates

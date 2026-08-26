@@ -50,8 +50,8 @@ def fp8_mqa_logits(
     num_warps: int = 0,
     TotalCuCount: int = 256,
     clean_logits: bool = True,
-    unroll2: bool = False,
-    reverse_rows: bool = False,
+    unroll2: int = -1,
+    reverse_rows: int = -1,
     out: Tensor | None = None,
 ) -> Tensor:
     """Prefill indexer logits over a contiguous K buffer.

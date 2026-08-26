@@ -2768,8 +2768,8 @@ namespace py = pybind11;
           py::arg("num_warps")    = 0,                 \
           py::arg("TotalCuCount") = 256,               \
           py::arg("clean_logits") = true,              \
-          py::arg("unroll2")      = false,             \
-          py::arg("reverse_rows") = false,           \
+          py::arg("unroll2")      = -1,             \
+          py::arg("reverse_rows") = -1,           \
           py::arg("out")          = std::nullopt);            \
     m.def("fp8_paged_mqa_logits",                \
           &fp8_paged_mqa_logits,                 \
