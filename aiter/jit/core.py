@@ -1258,7 +1258,11 @@ def _ctypes_call(func, fc_name, md_name):
         so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
         if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
             d_args = get_args_of_build(md_name)
-            d_args["torch_exclude"] = True
+            # [Moreh] module_top_k_per_row is a "mixed" module: its C-ABI fast
+            # entry points share a .so with torch-using pybind sources, so the
+            # build must keep torch headers/libs available.
+            if md_name != "module_top_k_per_row":
+                d_args["torch_exclude"] = True
             build_module(
                 md_name,
                 d_args["srcs"],
@@ -1272,6 +1276,7 @@ def _ctypes_call(func, fc_name, md_name):
                 d_args["is_standalone"],
                 d_args["torch_exclude"],
                 d_args.get("third_party", []),
+                hipify=d_args.get("hipify", False),
                 flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
             )
         lib = ctypes.CDLL(so_path)
