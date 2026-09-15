@@ -30,8 +30,17 @@ AITER_C_ITFS void top_k_per_row_prefill_fast(
 
     constexpr int kTopK = 2048;
     int64_t workspace_size = kTopK * (sizeof(float) + sizeof(int32_t)) * numRows;
-    void* workspace = nullptr;
-    HIP_CALL(hipMalloc(&workspace, workspace_size));
+
+    // Allocate the scratch workspace from torch's caching allocator (pooled,
+    // stream-ordered) instead of a raw per-call hipMalloc/hipFree. This restores
+    // the pre-refactor behavior: hipMalloc/hipFree are synchronous and dominated
+    // runtime for small prefills. The tensor stays alive until this function
+    // returns, i.e. after the kernel launch is enqueued on `stream`.
+    auto options = torch::TensorOptions()
+                       .dtype(torch::kUInt8)
+                       .device(torch::Device(torch::kCUDA, logits->device_id));
+    torch::Tensor workspace_tensor = torch::empty({workspace_size}, options);
+    void* workspace                = workspace_tensor.data_ptr();
 
     TopKPrefillKernelArgs args;
     size_t arg_size = sizeof(args);
@@ -59,6 +68,4 @@ AITER_C_ITFS void top_k_per_row_prefill_fast(
                                      kNumThreadsPerBlock,
                                      1, 1,
                                      stream});
-
-    HIP_CALL(hipFree(workspace));
 }
