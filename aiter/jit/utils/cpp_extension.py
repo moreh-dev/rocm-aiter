@@ -1782,12 +1782,19 @@ def _write_ninja_file(
 
     compiler = get_cxx_compiler()
 
+    # [Moreh] Optional compiler-cache launcher (e.g. "ccache"/"sccache").
+    # Off by default; enable with AITER_COMPILER_LAUNCHER=ccache. Prefixed onto
+    # BOTH cxx (host .cpp) and nvcc (hipcc device passes) so it covers all aiter
+    # kernel builds, which are compiled via hipcc after rename_cpp_to_cu().
+    _launcher = os.environ.get("AITER_COMPILER_LAUNCHER", "").strip()
+    _launcher_prefix = f"{_launcher} " if _launcher else ""
+
     # Version 1.3 is required for the `deps` directive.
     config = ["ninja_required_version = 1.3"]
-    config.append(f"cxx = {compiler}")
+    config.append(f"cxx = {_launcher_prefix}{compiler}")
     if with_cuda or cuda_dlink_post_cflags:
         nvcc = _join_rocm_home("bin", "hipcc")
-        config.append(f"nvcc = {nvcc}")
+        config.append(f"nvcc = {_launcher_prefix}{nvcc}")
 
     if IS_HIP_EXTENSION:
         post_cflags = COMMON_HIP_FLAGS + post_cflags
