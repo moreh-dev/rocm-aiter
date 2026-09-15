@@ -1983,6 +1983,30 @@ def get_2stage_cfgs(
             cfg_flat = run_1stage and bool(int(cfg["flat"]))
         else:
             cfg_flat = False
+
+    # [Moreh] gfx942 fp8 block-scale MoE: force the CK 2-stage path.
+    # The 1-stage assembly kernels (fmoe_bf16_blockscaleFp8_g1u1_*_1tg_*) read
+    # out of bounds and GPU-fault on gfx942 (MI300X) for per_1x128 fp8
+    # block-scale MoE (e.g. GLM-5.x-FP8): MEMORY_VIOLATION during cudagraph
+    # capture. Route these shapes through ck_moe_stage1/stage2, which the
+    # fp8-blockscale note above ("ck has better performance so disable assembly
+    # kernel") already prefers. See vllm-moreh PR #424 / FU-GLM5-GPUFAULT.
+    if (
+        run_1stage
+        and get_gfx() == "gfx942"
+        and q_type == QuantType.per_1x128
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+    ):
+        run_1stage = False
+        run_1stage_xbf16 = False
+        cfg_flat = False
+        kernelName1 = ""
+        kernelName2 = ""
+        block_m = 64 if token > 32 else 16
+        ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
+        use_non_temporal_load = use_nt(token, topk, expert)
+
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )
