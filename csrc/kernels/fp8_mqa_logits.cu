@@ -34,6 +34,15 @@ constexpr int HEAD_SIZE = 128;
 
 namespace mqa_dense {
 
+// V_MFMA_F32_32X32X64_F8F6F4 and v_permlane32_swap_b32 exist only on gfx950. The
+// host pass keeps the real body (kernel stubs); other device targets get a trap so
+// the multi-arch prebuild links.
+#if defined(__gfx950__) || !defined(__HIP_DEVICE_COMPILE__)
+#define MQA_LOGITS_ARCH_OK 1
+#else
+#define MQA_LOGITS_ARCH_OK 0
+#endif
+
 using f8x16 = __attribute__((__vector_size__(16))) fp8;
 using f8x32 = __attribute__((__vector_size__(32))) fp8;
 using f32x4 = __attribute__((__vector_size__(16))) float;
@@ -42,11 +51,13 @@ using f32x4 = __attribute__((__vector_size__(16))) float;
 // kernel for the full note: the clang builtin is unusable (both results land in one
 // VGPR) and the `s_nop 1` is mandatory (VALU write → permlane read needs 2 wait
 // states), otherwise the swap reads stale data.
+#if MQA_LOGITS_ARCH_OK
 __device__ __forceinline__ float swap32_hi(float x) {
     float hi;
     asm("s_nop 1\n\tv_permlane32_swap_b32 %0, %1" : "+v"(x), "=&v"(hi));
     return hi;
 }
+#endif  // MQA_LOGITS_ARCH_OK
 
 // relu(x). Compiled with -fno-honor-nans (set for this module in
 // aiter/jit/optCompilerConfig.json) this is a single
@@ -62,9 +73,11 @@ __device__ __forceinline__ float relu_fast(float x) { return fmaxf(x, 0.0f); }
 // a = (a.row0, b.row0) and b = (a.row1, b.row1), so a + b holds a's reduction in
 // lanes 0-31 and b's in lanes 32-63 — one swap and one add for two rows instead of
 // two of each, and the store that follows can use all 64 lanes instead of half.
+#if MQA_LOGITS_ARCH_OK
 __device__ __forceinline__ void swap32_reduce2(float& a, float& b) {
     asm("s_nop 1\n\tv_permlane32_swap_b32 %0, %1" : "+v"(a), "+v"(b));
 }
+#endif  // MQA_LOGITS_ARCH_OK
 
 // CLEAN_LOGITS=true makes the kernel itself write −inf outside every row's [ks, ke),
 // so the output buffer can be allocated with `empty` instead of `full(-inf)`. The
@@ -95,6 +108,7 @@ void fp8_mqa_logits_kernel(
     float*       __restrict__ logits_ptr,   // [M, N]
     int M, int N, int SplitN
 ){
+#if MQA_LOGITS_ARCH_OK
     constexpr int TILE_N = 32;              // K tokens per MFMA tile
     constexpr int NACC   = 16;              // C accumulator floats/lane
     using VecOutMFMA = __attribute__((__vector_size__(NACC * sizeof(float)))) float;
@@ -292,6 +306,11 @@ void fp8_mqa_logits_kernel(
     }
     for (; t < t_end; t += NUM_WARPS)
         compute_tile(load_tile(t));
+#else
+    // Multi-arch prebuild (GPU_ARCHS=gfx942;gfx950) compiles this TU for every arch;
+    // the Python wrapper (SUPPORTED_GFX) never launches it off gfx950.
+    __builtin_trap();
+#endif  // MQA_LOGITS_ARCH_OK
 }
 
 }  // namespace mqa_dense
