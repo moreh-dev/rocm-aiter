@@ -415,7 +415,7 @@ __device__ inline void fused_router_topk_reg(const FusedRouterArgs& r,
                 {
 #pragma unroll
                     for(int i = 0; i < VEC; ++i)
-                        g[b][rr * VEC + i] = -INFINITY; // never a candidate
+                        g[b][rr * VEC + i] = __builtin_nanf(""); // padding, see below
                 }
             }
         }
@@ -427,16 +427,16 @@ __device__ inline void fused_router_topk_reg(const FusedRouterArgs& r,
             if(t >= m_eff)
                 break;
 
+            // Score every expert exactly as grouped_topk does -- a -inf logit
+            // is sigmoid(-inf) = 0, a live candidate, not a hole. Padding past
+            // the router's experts was loaded as NaN, which sigmoid keeps NaN
+            // and the strict `x > mv` below never selects, so it cannot win
+            // even when every real score is 0, at no extra instruction.
             float s[NREG];
 #pragma unroll
             for(int j = 0; j < NREG; ++j)
-            {
-                const float x = g[b][j];
-                s[j] = (x == -INFINITY)
-                           ? -INFINITY
-                           : __builtin_amdgcn_rcpf(
-                                 1.0f + exp2f(static_cast<float>(-AITER_FUSED_SORT_LOG2E * x)));
-            }
+                s[j] = __builtin_amdgcn_rcpf(
+                    1.0f + exp2f(static_cast<float>(-AITER_FUSED_SORT_LOG2E * g[b][j])));
 
             float sum  = 0.0f;
             int my_id  = 0;

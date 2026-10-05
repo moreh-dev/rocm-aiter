@@ -45,22 +45,35 @@ static int block_override()
 // Cached per device, not per process: a multi-GPU process reaches this from
 // whichever device the caller has current, and the callers below install
 // HipDeviceGuard before asking.
-static size_t lds_budget_bytes()
+//
+// The wave width is cached alongside it. Every kernel here is written for
+// wave64 (DPP row_bcast:15/31 and readlane 63 in the arg-max, one 64-bit
+// bitmask word per wave), so a wave32 device (RDNA) must be reported
+// unsupported and take the stock path rather than launch and compute garbage.
+struct DeviceLimits
 {
-    static std::array<size_t, 64> cache{};
+    size_t lds_bytes;
+    int warp_size;
+};
+
+static DeviceLimits device_limits()
+{
+    static std::array<DeviceLimits, 64> cache{};
     static std::mutex mu;
     hipDevice_t dev;
     HIP_CALL(hipGetDevice(&dev));
     AITER_CHECK(dev >= 0 && dev < static_cast<int>(cache.size()), "device index out of range");
     std::lock_guard<std::mutex> lock(mu);
-    if(cache[dev] == 0)
+    if(cache[dev].lds_bytes == 0)
     {
         hipDeviceProp_t prop;
         HIP_CALL(hipGetDeviceProperties(&prop, dev));
-        cache[dev] = static_cast<size_t>(prop.sharedMemPerBlock);
+        cache[dev] = DeviceLimits{static_cast<size_t>(prop.sharedMemPerBlock), prop.warpSize};
     }
     return cache[dev];
 }
+
+static size_t lds_budget_bytes() { return device_limits().lds_bytes; }
 
 // Raise the dynamic-LDS limit of one kernel instantiation on the current
 // device, once. Checked: a rejected request would otherwise surface as a launch
@@ -181,6 +194,8 @@ struct LaunchPlan
 // better spent on reach.
 static LaunchPlan plan_launch(int num_tokens, int num_experts, int topk, int router_experts = 0)
 {
+    if(device_limits().warp_size != 64)
+        return LaunchPlan{false, false, 0}; // wave64-only kernels
     const int cap = router_experts > 0 ? max_fused_topk_tokens() : max_fused_tokens();
     if(num_tokens > cap)
         return LaunchPlan{false, false, 0};
@@ -337,8 +352,8 @@ void fused_moe_sorting_fwd(aiter_tensor_t& topk_ids,
 
     const auto plan = plan_launch(num_tokens, num_experts, topk);
     AITER_CHECK(plan.supported,
-                "fused_moe_sorting: shape outside the fused range (token cap or "
-                "LDS budget); caller should fall back to moe_sorting_opus");
+                "fused_moe_sorting: shape outside the fused range (token cap, "
+                "LDS budget or non-wave64 device); caller should fall back to moe_sorting_opus");
     AITER_CHECK(topk <= 255, "fused_moe_sorting: topk > 255 unsupported (8-bit slot)");
     check_outputs(sorted_token_ids,
                   sorted_weights,
@@ -512,8 +527,8 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
 
     const auto plan = plan_launch(num_tokens, num_experts, topk, router_experts);
     AITER_CHECK(plan.supported,
-                "fused_moe_sorting_topk: shape outside the fused range (token cap "
-                "or LDS budget); caller should fall back to grouped_topk + "
+                "fused_moe_sorting_topk: shape outside the fused range (token cap, "
+                "LDS budget or non-wave64 device); caller should fall back to grouped_topk + "
                 "moe_sorting_opus");
     AITER_CHECK(topk <= 8, "fused_moe_sorting_topk: topk > 8 unsupported");
     check_outputs(sorted_token_ids,

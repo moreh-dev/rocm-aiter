@@ -20,6 +20,7 @@ sweep, whose rows are also checked exactly before timing.
 
 import argparse
 import itertools
+import os
 
 import pandas as pd
 import torch
@@ -73,13 +74,15 @@ def _as_tuple(o):
     )
 
 
-def _check_exact(ref, out, topk, capacity, check_pad_weights=False):
+def _check_exact(ref, out, topk, capacity, check_pad_weights=False, nan_equal=False):
     """Names of the outputs that differ from the torch reference (empty = exact).
 
     Compares the live range [0, num_valid_ids[0]) of the ids, the weights at the
     real slots (bit equality; a NaN never compares equal), the block ids, both
     counters and the zeroed moe_buf. With check_pad_weights the padding weights
     must be 0.0f as well, which is the Opus contract the fused kernels reproduce.
+    With nan_equal a NaN weight matches a NaN in the same slot (a router row
+    that is all -inf renormalises 0/0 in grouped_topk and in the kernel alike).
     """
     ref_ids, ref_w, ref_eids, ref_nvalid = ref
     ids, w, eids, nvalid, moe_buf = out
@@ -91,7 +94,14 @@ def _check_exact(ref, out, topk, capacity, check_pad_weights=False):
     live = ref_ids[:n] != sentinel
     if not torch.equal(ref_ids[:n], ids[:n]):
         bad.append("sorted_ids")
-    if not torch.equal(ref_w[:n][live], w[:n][live]):
+    rw, ow = ref_w[:n][live], w[:n][live]
+    if nan_equal:
+        same = torch.equal(rw.isnan(), ow.isnan()) and torch.equal(
+            rw[~rw.isnan()], ow[~rw.isnan()]
+        )
+    else:
+        same = torch.equal(rw, ow)
+    if not same:
         bad.append("sorted_weights")
     if check_pad_weights and not torch.equal(
         w[:n][~live], torch.zeros_like(w[:n][~live])
@@ -105,9 +115,10 @@ def _check_exact(ref, out, topk, capacity, check_pad_weights=False):
     return bad
 
 
-def _router_inputs(token, router_e, topk, gating_dtype):
-    gating = (torch.randn((token, router_e), dtype=dtypes.fp32) * 3.0).to(gating_dtype)
-    gating = gating.contiguous()
+def _router_inputs(token, router_e, topk, gating_dtype, gating=None):
+    if gating is None:
+        gating = torch.randn((token, router_e), dtype=dtypes.fp32) * 3.0
+    gating = gating.to(gating_dtype).contiguous()
     topk_weights = torch.empty((token, topk), dtype=dtypes.fp32)
     topk_ids = torch.empty((token, topk), dtype=dtypes.i32)
     grouped_topk(
@@ -147,8 +158,10 @@ def test_fused_moe_sorting_exactness(model_dim=6144):
     torch.manual_seed(0)
     failures = []
 
-    def expect(name, ref, out, topk, capacity):
-        bad = _check_exact(ref, out, topk, capacity, check_pad_weights=True)
+    def expect(name, ref, out, topk, capacity, nan_equal=False):
+        bad = _check_exact(
+            ref, out, topk, capacity, check_pad_weights=True, nan_equal=nan_equal
+        )
         if bad:
             failures.append(f"{name}: {', '.join(bad)}")
 
@@ -193,6 +206,32 @@ def test_fused_moe_sorting_exactness(model_dim=6144):
             out = _run_fused(ids, w, E, unit, model_dim, None, None)
             expect(f"topk={topk_n} M={M}", ref, out, topk_n, M)
 
+    def run_fused_topk(tag, gating, ids, w, E_r, unit_size, nan_equal=False):
+        ref = run_torch_moe_sorting(ids, w, E_r, unit_size, None, None)
+        M_r = gating.shape[0]
+        o = _alloc_outputs(M_r, topk, E_r, unit_size, model_dim, dtypes.bf16)
+        sync = torch.zeros(2, dtype=dtypes.i32)
+        fused_moe_sorting_topk_fwd(
+            gating,
+            o["sorted_ids"],
+            o["sorted_weights"],
+            o["sorted_expert_ids"],
+            o["num_valid_ids"],
+            o["moe_buf"],
+            E_r,
+            topk,
+            int(unit_size),
+            ROUTER_RENORM,
+            ROUTER_SOFTMAX,
+            ROUTER_SCALE,
+            None,
+            None,
+            sync,
+        )
+        expect(tag, ref, _as_tuple(o), topk, M_r, nan_equal=nan_equal)
+        if int(sync[0].item()) != 0:
+            failures.append(f"{tag}: sync word not reset to 0")
+
     # 4. Fused router, fp32 and bf16 gating, against grouped_topk + torch sort.
     #    bf16 is the load-bearing case: duplicate scores inside the top-8 are
     #    common there and the arg-max tie order has to match aiter's exactly.
@@ -205,30 +244,42 @@ def test_fused_moe_sorting_exactness(model_dim=6144):
                 ):
                     continue
                 gating, ids, w = _router_inputs(M, router_e, topk, gating_dtype)
-                ref = run_torch_moe_sorting(ids, w, E, unit_size, None, None)
-                o = _alloc_outputs(M, topk, E, unit_size, model_dim, dtypes.bf16)
-                sync = torch.zeros(2, dtype=dtypes.i32)
-                fused_moe_sorting_topk_fwd(
-                    gating,
-                    o["sorted_ids"],
-                    o["sorted_weights"],
-                    o["sorted_expert_ids"],
-                    o["num_valid_ids"],
-                    o["moe_buf"],
-                    E,
-                    topk,
-                    int(unit_size),
-                    ROUTER_RENORM,
-                    ROUTER_SOFTMAX,
-                    ROUTER_SCALE,
-                    None,
-                    None,
-                    sync,
-                )
                 tag = f"fused_topk gating={gating_dtype} M={M} unit={unit_size}"
-                expect(tag, ref, _as_tuple(o), topk, M)
-                if int(sync[0].item()) != 0:
-                    failures.append(f"{tag}: sync word not reset to 0")
+                run_fused_topk(tag, gating, ids, w, E, unit_size)
+
+    # 5. -inf logits: sigmoid(-inf) = 0 is a live score in grouped_topk, so a
+    #    row with fewer than topk finite logits fills its top-k from the 0s
+    #    (tie order included), and an all -inf row picks k zero-score experts
+    #    with NaN weights after renorm. Router widths cover no padding (256), and
+    #    padding vectors in the NREG 4 (160) and NREG 8 (384) register routers,
+    #    which must never win even when every real score is 0; each one also
+    #    runs on the LDS router.
+    for router_e, M in ((256, 64), (160, 64), (384, 32)):
+        E_inf = router_e + 1
+        g = torch.randn((M, router_e), dtype=dtypes.fp32) * 3.0
+        for t in range(M):
+            n_fin = t % (topk + 2)  # 0..topk+1 finite logits, rest -inf
+            keep = torch.randperm(router_e)[:n_fin]
+            row = torch.full((router_e,), float("-inf"))
+            row[keep] = g[t, keep]
+            g[t] = row
+        for gating_dtype in (dtypes.fp32, dtypes.bf16):
+            for lds in (False, True):
+                if not fused_moe_sorting_topk_is_supported(
+                    M, E_inf, topk, unit, router_e
+                ):
+                    continue
+                gating, ids, w = _router_inputs(M, router_e, topk, gating_dtype, g)
+                tag = (
+                    f"-inf rows router_e={router_e} gating={gating_dtype} M={M}"
+                    f" router={'lds' if lds else 'reg'}"
+                )
+                if lds:
+                    os.environ["AITER_FUSED_MOE_SORTING_ROUTER_LDS"] = "1"
+                try:
+                    run_fused_topk(tag, gating, ids, w, E_inf, unit, nan_equal=True)
+                finally:
+                    os.environ.pop("AITER_FUSED_MOE_SORTING_ROUTER_LDS", None)
 
     if failures:
         raise AssertionError(
