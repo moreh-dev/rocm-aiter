@@ -26,6 +26,7 @@
 //   * packed id      = (slot << 24) | token_id
 //   * sentinel       = (topk << 24) | num_tokens   [num_tokens = static capacity]
 //   * each expert padded up to a multiple of unit_size; empty expert = 0 blocks
+//   * padding slots: id = sentinel, weight = 0.0f (as Opus writes them)
 //   * sorted_expert_ids holds the *local* expert index when expert_mask is set
 //   * num_valid_ids[0] = padded slot total, [1] = number of real tokens
 //   * moe_buf is zeroed by this same launch; a 0-element moe_buf is a no-op
@@ -136,74 +137,6 @@ struct FusedMoeSortingSmem
     }
 };
 
-// ---------------------------------------------------------------------------
-// Block-wide exclusive scan over `n` ints already in LDS.
-//
-// n is E, which is 257 for GLM-5.2 -- deliberately *not* assumed to fit the
-// block, since 257 > 256 breaks any "one element per thread" shortcut (and E
-// can be 385 elsewhere). Each thread serially folds a contiguous chunk, the
-// per-thread totals are scanned, then each thread rewrites its chunk.
-//
-// The cross-thread step runs on wave shuffles, not a Hillis-Steele pass over
-// LDS: with BLOCK=1024 the latter costs 20 __syncthreads per scan, and at
-// these shapes the scan is pure overhead sitting on the critical path of the
-// one workgroup that owns the sort. Shuffles bring it down to three barriers.
-template <int BLOCK>
-__device__ inline int fused_block_exclusive_scan(int32_t* data, int n, int32_t* tmp)
-{
-    constexpr int NW = BLOCK / 64;
-    const int tid    = threadIdx.x;
-    const int lane   = tid & 63;
-    const int wave   = tid >> 6;
-
-    const int chunk = (n + BLOCK - 1) / BLOCK;
-    const int beg   = tid * chunk;
-    const int end   = min(beg + chunk, n);
-
-    int local = 0;
-    for(int i = beg; i < end; ++i)
-        local += data[i];
-
-    // Inclusive scan inside the wave.
-    int v = local;
-    for(int off = 1; off < 64; off <<= 1)
-    {
-        const int u = __shfl_up(v, off, 64);
-        if(lane >= off)
-            v += u;
-    }
-    if(lane == 63)
-        tmp[wave] = v;
-    __syncthreads();
-
-    // Scan the NW wave totals (NW <= 16) inside wave 0.
-    if(tid < NW)
-    {
-        int w = tmp[tid];
-        for(int off = 1; off < NW; off <<= 1)
-        {
-            const int u = __shfl_up(w, off, 64);
-            if(tid >= off)
-                w += u;
-        }
-        tmp[tid] = w;
-    }
-    __syncthreads();
-
-    const int wave_off = (wave == 0) ? 0 : tmp[wave - 1];
-    const int total    = tmp[NW - 1];
-
-    int run = wave_off + v - local; // exclusive prefix of this thread's chunk
-    for(int i = beg; i < end; ++i)
-    {
-        const int x = data[i];
-        data[i]     = run;
-        run += x;
-    }
-    __syncthreads();
-    return total;
-}
-
 // Inclusive prefix sum across a wave64 in DPP: four row_shr steps inside each
 // 16-lane row, then row_bcast:15 into rows 1 and 3 and row_bcast:31 into rows
 // 2 and 3. Six VALU ops with 1-2 wait states each, versus the __shfl_up loop
@@ -240,7 +173,7 @@ __device__ inline int fused_wave_inclusive_scan_i32(int v)
 // through a shuffle scan, then each lane rewrites its chunk. Returns the total
 // in every lane of the wave.
 //
-// This replaced the block-wide scan (fused_block_exclusive_scan) for the sort's
+// This replaced a block-wide scan for the sort's
 // phase 3. That one spent three block barriers to scan 257 numbers -- with 16
 // waves each barrier is ~135 ns -- and measured 0.96 us for the phase. n here
 // is E, at most a few hundred, so one wave with a short serial chunk per lane
@@ -812,6 +745,10 @@ fused_moe_sorting_body(const int32_t* __restrict__ topk_ids,
         if constexpr(RNREG > 0)
             if(router.sync != nullptr)
             {
+                // Every router wave routes one token and the remaining waves clear
+                // the mask, so at least one wave has to be left over. The host
+                // clamps RW to BLOCK; this pins the contract at compile time.
+                static_assert(RW * 64 < BLOCK, "RW router waves must leave a non-router wave");
                 // Block 0 routes its own RW tokens straight into LDS ...
                 if((threadIdx.x >> 6) < RW)
                     fused_router_topk_reg<BLOCK, RNREG, 1>(
@@ -926,17 +863,30 @@ fused_moe_sorting_body(const int32_t* __restrict__ topk_ids,
     // total_padded is a multiple of unit_size; when that is a multiple of 4 the
     // whole live range is 16 B-aligned (torch buffers are), so four slots go
     // per store. 7100 slots at M=64 drop from 7 rounds to 2.
-    if((total_padded & 3) == 0 && (reinterpret_cast<uintptr_t>(sorted_ids) & 15) == 0)
+    // The padding slots of sorted_weights are written too (0.0f), as Opus does
+    // in all three of its paths: consumers are entitled to the same contract
+    // whichever sort produced the buffer, and a pad slot holding stale caller
+    // memory is the kind of state nobody tests for.
+    if((total_padded & 3) == 0 && (reinterpret_cast<uintptr_t>(sorted_ids) & 15) == 0 &&
+       (reinterpret_cast<uintptr_t>(sorted_weights) & 15) == 0)
     {
         uint4* v4      = reinterpret_cast<uint4*>(sorted_ids);
+        uint4* w4      = reinterpret_cast<uint4*>(sorted_weights);
         const uint4 sv = make_uint4(sentinel, sentinel, sentinel, sentinel);
+        const uint4 zv = make_uint4(0u, 0u, 0u, 0u);
         for(int k = tid; k < (total_padded >> 2); k += BLOCK)
+        {
             v4[k] = sv;
+            w4[k] = zv;
+        }
     }
     else
     {
         for(int k = tid; k < total_padded; k += BLOCK)
-            sorted_ids[k] = sentinel;
+        {
+            sorted_ids[k]     = sentinel;
+            sorted_weights[k] = 0.0f;
+        }
     }
 
     // 4b. Block ids: one thread per expert, so E=257 is a single pass.
