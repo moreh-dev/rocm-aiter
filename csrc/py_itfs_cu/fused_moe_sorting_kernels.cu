@@ -441,7 +441,7 @@ void fused_moe_sorting_fwd(aiter_tensor_t& topk_ids,
 
 namespace {
 
-template <int BLOCK, int RNREG, int RW>
+template <int BLOCK, int RNREG, int RW, bool BIAS>
 static void launch_topk(const LaunchPlan& plan,
                         dim3 grid,
                         hipStream_t stream,
@@ -461,10 +461,10 @@ static void launch_topk(const LaunchPlan& plan,
                         aiter::FusedRouterArgs router)
 {
     static std::array<bool, 64> done{};
-    raise_lds_limit(&aiter::fused_moe_sorting_topk_bitmask<BLOCK, true, RNREG, RW>, done);
+    raise_lds_limit(&aiter::fused_moe_sorting_topk_bitmask<BLOCK, true, RNREG, RW, BIAS>, done);
 
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(aiter::fused_moe_sorting_topk_bitmask<BLOCK, true, RNREG, RW>),
+        HIP_KERNEL_NAME(aiter::fused_moe_sorting_topk_bitmask<BLOCK, true, RNREG, RW, BIAS>),
         grid,
         dim3(BLOCK),
         plan.smem_bytes,
@@ -488,13 +488,22 @@ static void launch_topk(const LaunchPlan& plan,
 
 } // namespace
 
-bool fused_moe_sorting_topk_is_supported(
-    int tokens, int num_experts, int topk, int unit_size, int router_experts)
+bool fused_moe_sorting_topk_is_supported(int tokens,
+                                         int num_experts,
+                                         int topk,
+                                         int unit_size,
+                                         int router_experts,
+                                         int num_fused_shared_experts)
 {
     if(tokens <= 0 || num_experts <= 0 || topk <= 0 || unit_size <= 0 || router_experts <= 0)
         return false;
-    if(topk > 8)
-        return false; // the fused router keeps result k in lane k of an 8-lane row
+    // topk counts every slot, shared ones included (vLLM's convention); at most
+    // 8 of them are routed, and at most one shared expert is fused.
+    if(num_fused_shared_experts < 0 || num_fused_shared_experts > 1 ||
+       topk - num_fused_shared_experts < 1 || topk - num_fused_shared_experts > 8)
+        return false;
+    if(num_experts < router_experts + num_fused_shared_experts)
+        return false; // the shared ids router_experts.. must be valid sort experts
     return plan_launch(tokens, num_experts, topk, router_experts).supported;
 }
 
@@ -512,7 +521,10 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
                                 float routed_scaling_factor,
                                 std::optional<aiter_tensor_t> local_expert_mask,
                                 std::optional<aiter_tensor_t> num_local_tokens,
-                                std::optional<aiter_tensor_t> sync)
+                                std::optional<aiter_tensor_t> sync,
+                                std::optional<aiter_tensor_t> correction_bias,
+                                int num_fused_shared_experts,
+                                float shared_expert_weight)
 {
     const AiterThrowGuard throw_guard;
 
@@ -530,7 +542,25 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
                 "fused_moe_sorting_topk: shape outside the fused range (token cap, "
                 "LDS budget or non-wave64 device); caller should fall back to grouped_topk + "
                 "moe_sorting_opus");
-    AITER_CHECK(topk <= 8, "fused_moe_sorting_topk: topk > 8 unsupported");
+    AITER_CHECK(num_fused_shared_experts >= 0 && num_fused_shared_experts <= 1,
+                "fused_moe_sorting_topk: num_fused_shared_experts must be 0 or 1");
+    AITER_CHECK(topk - num_fused_shared_experts >= 1 && topk - num_fused_shared_experts <= 8,
+                "fused_moe_sorting_topk: 1..8 routed experts per token (topk counts shared slots)");
+    AITER_CHECK(num_experts >= router_experts + num_fused_shared_experts,
+                "fused_moe_sorting_topk: num_experts must cover router_experts + shared experts");
+    const void* bias_ptr = nullptr;
+    bool bias_is_fp32    = false;
+    if(correction_bias.has_value())
+    {
+        const auto& b = correction_bias.value();
+        AITER_CHECK(!is_softmax, "fused_moe_sorting_topk: correction_bias needs sigmoid routing");
+        AITER_CHECK(b.is_contiguous() && b.numel() >= router_experts,
+                    "correction_bias must be contiguous [>= router_experts]");
+        bias_is_fp32 = b.dtype() == AITER_DTYPE_fp32;
+        AITER_CHECK(bias_is_fp32 || b.dtype() == AITER_DTYPE_bf16,
+                    "correction_bias must be fp32 or bf16");
+        bias_ptr = b.data_ptr();
+    }
     check_outputs(sorted_token_ids,
                   sorted_weights,
                   sorted_expert_ids,
@@ -565,8 +595,10 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
     // (NREG 8) vectors per lane, and a 16 B-aligned gating tile for the float4
     // loads. Everything else takes the LDS router (RNREG 0).
     int rnreg = 0;
+    // The bias is read with the same vector loads, so it must be aligned too.
     if(!is_softmax && router_experts % 4 == 0 &&
-       (reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % 16) == 0)
+       (reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % 16) == 0 &&
+       (reinterpret_cast<uintptr_t>(bias_ptr) % 16) == 0)
     {
         const int nvec = router_experts / 4;
         rnreg          = nvec <= 64 ? 4 : (nvec <= 128 ? 8 : 0);
@@ -603,7 +635,11 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
                                   is_softmax,
                                   routed_scaling_factor,
                                   sync_ptr,
-                                  router_blocks};
+                                  router_blocks,
+                                  bias_ptr,
+                                  bias_is_fp32,
+                                  num_fused_shared_experts,
+                                  shared_expert_weight};
 
     const auto* mask_ptr = local_expert_mask.has_value()
                                ? static_cast<const int32_t*>(local_expert_mask.value().data_ptr())
@@ -612,8 +648,31 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
                                ? static_cast<const int32_t*>(num_local_tokens.value().data_ptr())
                                : nullptr;
 
+    // The register router specialises on the bias; the LDS router (RNREG 0)
+    // reads it through the runtime pointer, so it needs no second instantiation.
     auto go = [&](auto block_tag, auto rn_tag, auto rw_tag) {
-        launch_topk<decltype(block_tag)::value, decltype(rn_tag)::value, decltype(rw_tag)::value>(
+        constexpr int RN = decltype(rn_tag)::value;
+        if constexpr(RN > 0)
+            if(bias_ptr != nullptr)
+                return launch_topk<decltype(block_tag)::value, RN, decltype(rw_tag)::value, true>(
+                    plan,
+                    grid,
+                    stream,
+                    mask_ptr,
+                    nlt_ptr,
+                    static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+                    static_cast<float*>(sorted_weights.data_ptr()),
+                    static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+                    static_cast<int32_t*>(num_valid_ids.data_ptr()),
+                    moe_buf.data_ptr(),
+                    num_tokens,
+                    topk,
+                    num_experts,
+                    unit_size,
+                    moe_buf_bytes,
+                    zero_blocks,
+                    router);
+        launch_topk<decltype(block_tag)::value, RN, decltype(rw_tag)::value, false>(
             plan,
             grid,
             stream,

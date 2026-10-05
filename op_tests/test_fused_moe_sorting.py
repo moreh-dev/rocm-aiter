@@ -35,7 +35,7 @@ from aiter.ops.fused_moe_sorting import (
     fused_moe_sorting_topk_fwd,
     fused_moe_sorting_topk_is_supported,
 )
-from aiter.ops.topk import grouped_topk
+from aiter.ops.topk import biased_grouped_topk, grouped_topk
 from aiter.test_common import benchmark, run_perftest
 
 torch.set_default_device("cuda")
@@ -49,6 +49,7 @@ ROUTER_TOPK_GROUP = 1
 ROUTER_RENORM = True
 ROUTER_SOFTMAX = False
 ROUTER_SCALE = 2.5
+SHARED_W = 1.0
 
 
 def _alloc_outputs(token, topk, E, unit_size, model_dim, dtype):
@@ -206,10 +207,12 @@ def test_fused_moe_sorting_exactness(model_dim=6144):
             out = _run_fused(ids, w, E, unit, model_dim, None, None)
             expect(f"topk={topk_n} M={M}", ref, out, topk_n, M)
 
-    def run_fused_topk(tag, gating, ids, w, E_r, unit_size, nan_equal=False):
+    def run_fused_topk(
+        tag, gating, ids, w, E_r, unit_size, nan_equal=False, bias=None, n_shared=0
+    ):
         ref = run_torch_moe_sorting(ids, w, E_r, unit_size, None, None)
-        M_r = gating.shape[0]
-        o = _alloc_outputs(M_r, topk, E_r, unit_size, model_dim, dtypes.bf16)
+        M_r, topk_r = ids.shape
+        o = _alloc_outputs(M_r, topk_r, E_r, unit_size, model_dim, dtypes.bf16)
         sync = torch.zeros(2, dtype=dtypes.i32)
         fused_moe_sorting_topk_fwd(
             gating,
@@ -219,7 +222,7 @@ def test_fused_moe_sorting_exactness(model_dim=6144):
             o["num_valid_ids"],
             o["moe_buf"],
             E_r,
-            topk,
+            topk_r,
             int(unit_size),
             ROUTER_RENORM,
             ROUTER_SOFTMAX,
@@ -227,8 +230,11 @@ def test_fused_moe_sorting_exactness(model_dim=6144):
             None,
             None,
             sync,
+            bias,
+            n_shared,
+            SHARED_W,
         )
-        expect(tag, ref, _as_tuple(o), topk, M_r, nan_equal=nan_equal)
+        expect(tag, ref, _as_tuple(o), topk_r, M_r, nan_equal=nan_equal)
         if int(sync[0].item()) != 0:
             failures.append(f"{tag}: sync word not reset to 0")
 
@@ -280,6 +286,66 @@ def test_fused_moe_sorting_exactness(model_dim=6144):
                     run_fused_topk(tag, gating, ids, w, E_inf, unit, nan_equal=True)
                 finally:
                     os.environ.pop("AITER_FUSED_MOE_SORTING_ROUTER_LDS", None)
+
+    # 6. Biased routing + a fused shared expert -- the GLM-5.2 / DeepSeek decode
+    #    preamble as vLLM drives it: experts chosen on sigmoid + bias, weighted by
+    #    the unbiased sigmoid, plus one shared slot (id router_e, fixed weight)
+    #    that renorm and the scale never touch. The reference is aiter's own
+    #    biased_grouped_topk writing the routed columns of a [M, topk + 1] buffer
+    #    whose shared column is preset, which is exactly what vLLM hands aiter.
+    #    The bias is randn: its ties have to resolve like the stock kernel's.
+    for router_e, M_list in ((256, (1, 16, 64, 80)), (384, (1, 32))):
+        E_b = router_e + 1
+        bias32 = torch.randn(router_e, dtype=dtypes.fp32)
+        for gating_dtype in (dtypes.fp32, dtypes.bf16):
+            for M in M_list:
+                for n_shared in (0, 1):
+                    topk_t = topk + n_shared
+                    if not fused_moe_sorting_topk_is_supported(
+                        M, E_b, topk_t, unit, router_e, n_shared
+                    ):
+                        continue
+                    torch.manual_seed(100 + M)
+                    gating = (
+                        (torch.randn((M, router_e), dtype=dtypes.fp32) * 3.0)
+                        .to(gating_dtype)
+                        .contiguous()
+                    )
+                    bias = bias32.to(gating_dtype)  # stock reads it in gating dtype
+                    ids = torch.empty((M, topk_t), dtype=dtypes.i32)
+                    w = torch.empty((M, topk_t), dtype=dtypes.fp32)
+                    ids[:, topk:] = router_e
+                    w[:, topk:] = SHARED_W
+                    biased_grouped_topk(
+                        gating,
+                        bias,
+                        w[:, :topk],
+                        ids[:, :topk],
+                        1,
+                        1,
+                        ROUTER_RENORM,
+                        ROUTER_SCALE,
+                    )
+                    for lds in (False, True):
+                        tag = (
+                            f"biased router_e={router_e} gating={gating_dtype} M={M}"
+                            f" shared={n_shared} router={'lds' if lds else 'reg'}"
+                        )
+                        if lds:
+                            os.environ["AITER_FUSED_MOE_SORTING_ROUTER_LDS"] = "1"
+                        try:
+                            run_fused_topk(
+                                tag,
+                                gating,
+                                ids,
+                                w,
+                                E_b,
+                                unit,
+                                bias=bias,
+                                n_shared=n_shared,
+                            )
+                        finally:
+                            os.environ.pop("AITER_FUSED_MOE_SORTING_ROUTER_LDS", None)
 
     if failures:
         raise AssertionError(
