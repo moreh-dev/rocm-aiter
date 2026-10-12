@@ -45,6 +45,7 @@ namespace mqa_paged {
 
 using f8x16 = __attribute__((__vector_size__(16))) fp8;
 using f8x32 = __attribute__((__vector_size__(32))) fp8;
+using u32x4 = __attribute__((__vector_size__(16))) unsigned int;
 
 // lanes 0-31 receive x[lane+32]; lanes 32-63 get garbage (unused).
 // `v_permlane32_swap_b32 a, b` → a = (a.row0, b.row0), b = (a.row1, b.row1), so b's
@@ -69,8 +70,11 @@ __device__ __forceinline__ float swap32_hi(float x) {
     return hi;
 }
 
+// R=6's register double buffer fits 256 registers (2 waves/SIMD, what the ~2 blocks/CU
+// grid needs) only when the compiler is held to 2 waves/SIMD; uncapped it takes 272 and
+// runs 1 wave/SIMD. Held to 2 it moves the accumulator out of AGPRs, with no spill.
 template <int NUM_WARPS, int CHUNK_K, int KV_BLOCK_SIZE, int ROWS_PER_BLOCK>
-__global__ __launch_bounds__(NUM_WARPS * WARP_SIZE)
+__global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, ROWS_PER_BLOCK == 6 ? 2 : 1)
 void fp8_paged_mqa_logits_kernel(
     const fp8*   __restrict__ Q_ptr,
     const fp8*   __restrict__ kv_cache_ptr,
@@ -101,7 +105,9 @@ void fp8_paged_mqa_logits_kernel(
     if (split_start >= ctx_len) return;
 
     const int l    = threadIdx.x % WARP_SIZE;
-    const int warpId = threadIdx.x / WARP_SIZE;
+    // Wave-uniform by construction; readfirstlane lets the compiler keep tile indices in
+    // SGPRs, so the KVBlockSize=64 page-id loads become scalar loads.
+    const int warpId = __builtin_amdgcn_readfirstlane(threadIdx.x / WARP_SIZE);
     const int rw    = l / 16;
     const int col   = l % 16;
     const int nA    = col + 16 * (rw & 1);     // input M/N index (0..31)
@@ -118,17 +124,18 @@ void fp8_paged_mqa_logits_kernel(
     auto pack = [&](f8x16 lo, f8x16 hi) -> f8x32 {
         f8x32 v; *reinterpret_cast<f8x16*>(&v) = lo; *(reinterpret_cast<f8x16*>(&v) + 1) = hi; return v;
     };
-    // 16 contiguous fp8 of K at (token, 16-dim run d_hi) given resolved block blk.
-    auto kv16 = [&](int blk, int token, int d_hi) -> f8x16 {
+    // Byte offset of the 16 contiguous fp8 of K at (token, 16-dim run d_hi) in block blk.
+    auto kv_off = [&](int blk, int token, int d_hi) -> int64_t {
         const int off = token % KV_BLOCK_SIZE;
         const int64_t base = (int64_t)blk * (KV_BLOCK_SIZE * index_dim);
-        int64_t a;
         if constexpr (PRESHUFFLE)
-            a = base + (int64_t)d_hi * 256 + (off & 15) * 16
-              + ((off & (KV_BLOCK_SIZE - 1)) >> 4) * 16 * HEAD_SIZE;
+            return base + (int64_t)d_hi * 256 + (off & 15) * 16
+                 + ((off & (KV_BLOCK_SIZE - 1)) >> 4) * 16 * HEAD_SIZE;
         else
-            a = base + (int64_t)off * HEAD_SIZE + d_hi * 16;
-        return *reinterpret_cast<const f8x16*>(kv_cache_ptr + a);
+            return base + (int64_t)off * HEAD_SIZE + d_hi * 16;
+    };
+    auto kv16 = [&](int blk, int token, int d_hi) -> f8x16 {
+        return *reinterpret_cast<const f8x16*>(kv_cache_ptr + kv_off(blk, token, d_hi));
     };
     auto scale_addr = [&](int blk, int token) -> int64_t {
         const int off = token % KV_BLOCK_SIZE;
@@ -163,25 +170,9 @@ void fp8_paged_mqa_logits_kernel(
     }
 
     const int num_tiles = CDIV(split_end - split_start, TILE_N);
-    int blk_cur = load_blk(warpId);
-    for (int t = warpId; t < num_tiles; t += NUM_WARPS) {
-        const int blk_next = load_blk(t + NUM_WARPS);
-        const int token_base = split_start + t * TILE_N;
-        const int token      = token_base + nA;
 
-        f8x32 vB0, vB1;
-        if (blk_cur >= 0 && token < ctx_len) {
-            vB0 = pack(kv16(blk_cur, token, dhalf), kv16(blk_cur, token, 2 + dhalf));
-            vB1 = pack(kv16(blk_cur, token, 4 + dhalf), kv16(blk_cur, token, 6 + dhalf));
-        } else { vB0 = f8x32{}; vB1 = f8x32{}; }
-
-        const int stoken = token_base + jtok;
-        int blk_s = blk_cur;
-        if constexpr (KV_BLOCK_SIZE == 1) blk_s = (stoken < ctx_len) ? bt[stoken] : -1;
-        const float kv_scale = (stoken < ctx_len && blk_s >= 0)
-            ? *reinterpret_cast<const float*>(kv_cache_ptr + scale_addr(blk_s, stoken)) : 0.0f;
-        blk_cur = blk_next;
-
+    // One tile: ROWS_PER_BLOCK rows x 32 tokens of logits from the tile's K and scale.
+    auto compute_tile = [&](int token_base, const f8x32& vB0, const f8x32& vB1, float kv_scale) {
         #pragma unroll
         for (int r = 0; r < ROWS_PER_BLOCK; ++r) {
             if (row_start + r >= next_n) break;
@@ -208,6 +199,98 @@ void fp8_paged_mqa_logits_kernel(
                 if (abs_pos < ctx_len && abs_pos <= causal_limit && abs_pos < max_model_len)
                     logits_ptr[(int64_t)(q_row0 + r) * max_model_len + abs_pos] = partial;
             }
+        }
+    };
+
+    // R <= 6: register double buffer (R=6 relies on the launch bounds above to stay at
+    // 2 waves/SIMD). R=8 keeps the single-buffered loop.
+    constexpr bool PREFETCH = ROWS_PER_BLOCK <= 6;
+    if constexpr (PREFETCH) {
+        // Tile t's K and scale are loaded in the iteration before it, ahead of that
+        // iteration's MFMAs, so each wave keeps the next tile in flight while it computes
+        // the current one. Every tile of the split starts below ctx_len, so its page id
+        // is valid; only lanes of the last tile can pass ctx_len, and their logits are
+        // masked at the store. So the indices are clamped and the loads are issued
+        // unconditionally, under wave-uniform guards only: a load under a lane-divergent
+        // branch has to land before the branch rejoins, which serialises it again.
+        auto kpage = [&](int tt) -> int {          // page of this lane's K-operand token
+            if constexpr (KV_BLOCK_SIZE == 1)
+                return bt[min(split_start + tt * TILE_N + nA, ctx_len - 1)];
+            else
+                return bt[(split_start + tt * TILE_N) / KV_BLOCK_SIZE];
+        };
+        auto spage = [&](int tt) -> int {          // page of this lane's output token
+            if constexpr (KV_BLOCK_SIZE == 1)
+                return bt[min(split_start + tt * TILE_N + jtok, ctx_len - 1)];
+            else
+                return kpage(tt);                  // a 32-token tile never straddles a page
+        };
+        // The buffered tile is carried as 32-bit words and repacked into the MFMA's fp8
+        // operand only where it is consumed: a loop-carried vector of 32 bytes makes the
+        // compiler move it byte by byte (~130 v_perm/sdwa/shift VALU per tile).
+        auto load_k = [&](int blk, int tt, u32x4 (&k)[4]) {
+            const int token = split_start + tt * TILE_N + nA;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)   // 16-dim runs dhalf, 2+dhalf, 4+dhalf, 6+dhalf
+                k[i] = *reinterpret_cast<const u32x4*>(kv_cache_ptr + kv_off(blk, token, 2 * i + dhalf));
+        };
+        auto pack_u = [&](u32x4 lo, u32x4 hi) -> f8x32 {
+            f8x32 v; *reinterpret_cast<u32x4*>(&v) = lo; *(reinterpret_cast<u32x4*>(&v) + 1) = hi; return v;
+        };
+        auto load_scale = [&](int blk, int tt) -> float {
+            return *reinterpret_cast<const float*>(
+                kv_cache_ptr + scale_addr(blk, split_start + tt * TILE_N + jtok));
+        };
+
+        // No branch around a prefetch, not even a wave-uniform one: the compiler merges
+        // the loaded registers with the untaken path by copying them where the branch
+        // rejoins, and a copy has to wait for its load. Past the split end, the "next"
+        // tile is the current one instead (already in L2), so the loads stay unconditional.
+        auto next_of = [&](int tt) { return tt + NUM_WARPS < num_tiles ? tt + NUM_WARPS : tt; };
+
+        int t = warpId;
+        if (t >= num_tiles) return;
+        u32x4 cur[4];
+        load_k(kpage(t), t, cur);
+        float kv_scale = load_scale(spage(t), t);
+        int kblk_next = kpage(next_of(t)), sblk_next = spage(next_of(t));
+        for (; t < num_tiles; t += NUM_WARPS) {
+            // The next tile's K and scale, then the page ids for the tile after it. The
+            // ids go last so that waiting for this iteration's ids never also waits for
+            // the K loads (scalar loads can only be waited for all at once).
+            const int tn = next_of(t);
+            u32x4 nxt[4];
+            load_k(kblk_next, tn, nxt);
+            const float n_scale = load_scale(sblk_next, tn);
+            kblk_next = kpage(next_of(tn));
+            sblk_next = spage(next_of(tn));
+
+            compute_tile(split_start + t * TILE_N, pack_u(cur[0], cur[1]), pack_u(cur[2], cur[3]), kv_scale);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) cur[i] = nxt[i];
+            kv_scale = n_scale;
+        }
+    } else {
+        int blk_cur = load_blk(warpId);
+        for (int t = warpId; t < num_tiles; t += NUM_WARPS) {
+            const int blk_next = load_blk(t + NUM_WARPS);
+            const int token_base = split_start + t * TILE_N;
+            const int token      = token_base + nA;
+
+            f8x32 vB0, vB1;
+            if (blk_cur >= 0 && token < ctx_len) {
+                vB0 = pack(kv16(blk_cur, token, dhalf), kv16(blk_cur, token, 2 + dhalf));
+                vB1 = pack(kv16(blk_cur, token, 4 + dhalf), kv16(blk_cur, token, 6 + dhalf));
+            } else { vB0 = f8x32{}; vB1 = f8x32{}; }
+
+            const int stoken = token_base + jtok;
+            int blk_s = blk_cur;
+            if constexpr (KV_BLOCK_SIZE == 1) blk_s = (stoken < ctx_len) ? bt[stoken] : -1;
+            const float kv_scale = (stoken < ctx_len && blk_s >= 0)
+                ? *reinterpret_cast<const float*>(kv_cache_ptr + scale_addr(blk_s, stoken)) : 0.0f;
+            blk_cur = blk_next;
+
+            compute_tile(token_base, vB0, vB1, kv_scale);
         }
     }
 }
@@ -319,13 +402,21 @@ torch::Tensor fp8_paged_mqa_logits(
 
     // ---- autotune ChunkK, num_warps, R, SplitKV ----
     // From the gfx950 reliable (cache-busting) sweep, the best config tracks the
-    // total K footprint tot = batch*ctx_len (redundancy vs occupancy trade):
-    //   tot <  32K  → R=1  (tiny: maximise occupancy, K-redundancy is ~free/L2)
-    //   tot < 158K  → R=2  (mid: occupancy still dominates)
-    //   else        → R=3  (bandwidth-bound: minimise redundant K reads; plenty
-    //                       of work for occupancy). R>=4/6 never wins (q_reg
-    //                       register pressure kills waves — occupancy is the only
-    //                       HBM-latency hider; prefetch/large-R both hurt).
+    // total K footprint tot = batch*max_model_len (redundancy vs occupancy trade):
+    //   tot <  90K  → R=1  (tiny: maximise occupancy, K-redundancy is ~free/L2)
+    //   tot < 280K  → R=2  (mid: occupancy still dominates)
+    //   else        → bandwidth-bound: each row group streams the whole K cache,
+    //                 so R=3 groups re-read K for next_n > 3. Fewer groups where
+    //                 measured to pay (block 64, ctx 1K-128K, vs R=3):
+    //                   next_n=4    R=4: one pass vs 3+1; even at tot 0.5M,
+    //                               1.10-1.51x from 1M
+    //                   next_n=5,6  R=6 from tot 2M: one pass vs 3+2 / 3+3;
+    //                               1.01-1.09x at 2M, 1.12-1.37x from 4M,
+    //                               0.93-1.02x at 1M
+    //                   next_n=7,8  R=4 from tot 1M: two passes vs three;
+    //                               1.02-1.26x. R=8 is slower (0.83-0.95x).
+    //                 The grid fills 2 waves/SIMD, which R=4 (192 regs) and R=6
+    //                 (256) still fit, so the larger R costs no occupancy here.
     //   CHUNK_K = 128 for long ctx (more splittable tiles) or R=1; else 256.
     //   num_warps = 8 except the tiny R=1 case (4).
     const int mml_i = static_cast<int>(max_model_len);
@@ -339,8 +430,21 @@ torch::Tensor fp8_paged_mqa_logits(
     // Fitted against a 35-shape tuning sweep.
     // num_warps=4 is the broad optimum, with 8 only in a mid band; large total
     // footprints want the small chunk.
-    if (rows_per_block <= 0) rows_per_block = (tot < 90000) ? 1 : (tot < 280000 ? 2 : 3);
-    if (rows_per_block > next_n) rows_per_block = next_n;
+    if (rows_per_block <= 0) {
+        rows_per_block = (tot < 90000) ? 1 : (tot < 280000 ? 2 : 3);
+        if (rows_per_block == 3) {
+            if (next_n == 4)
+                rows_per_block = 4;
+            else if ((next_n == 5 || next_n == 6) && tot >= 2000000)
+                rows_per_block = 6;
+            else if ((next_n == 7 || next_n == 8) && tot >= 1000000)
+                rows_per_block = 4;
+        }
+    }
+    // At most next_n rows, rounded up to an instantiated R (5 -> 6, 7 -> 8); the
+    // kernel skips rows past next_n.
+    if (rows_per_block > next_n)
+        rows_per_block = next_n <= 4 ? next_n : (next_n <= 6 ? 6 : 8);
     if (num_warps_i <= 0) num_warps_i = (tot >= 80000 && tot < 280000) ? 8 : 4;
     if (chunk_k_i   <= 0)
         chunk_k_i = (mml_i >= 50000) ? (tot >= 400000 ? 64 : 128)
