@@ -3,12 +3,21 @@
 """Correctness + perf sweep for the decode FP8 paged MQA indexer logits kernels.
 
 Candidates are the production Triton/Gluon kernel
-(`deepgemm_fp8_paged_mqa_logits`) and the hand-written HIP one
-(`aiter.ops.fp8_paged_mqa_logits`), graded against the same fp32 torch reference
-on identical inputs.
+(`deepgemm_fp8_paged_mqa_logits`), the hand-written HIP one
+(`aiter.ops.fp8_paged_mqa_logits`) and the FlyDSL one
+(`aiter.ops.flydsl.flydsl_fp8_paged_mqa_logits`), graded against the same fp32
+torch reference on identical inputs.
 
-The HIP kernel only covers nh=32/hd=128 on gfx950 and KVBlockSize in {1, 64}, so
-it is added per case rather than unconditionally; its cells stay NaN elsewhere.
+The HIP kernel only covers nh=32/hd=128 on gfx950 and KVBlockSize in {1, 64}, and
+the FlyDSL one only nh=32/hd=128 on gfx950 over the KVBlockSize=64 preshuffled
+cache with next_n <= 8, so each is added per case rather than unconditionally;
+their cells stay NaN elsewhere.
+
+FlyDSL's one runtime knob is SplitKV; its build is fixed otherwise. By default it
+runs at its own auto split. --flydsl-tune sweeps SplitKV per case on the case's
+own inputs and times the fastest, so those rows are FlyDSL at its best split
+rather than at what a host heuristic would pick. The "flydsl SplitKV" column
+records the split either way.
 """
 
 import argparse
@@ -41,6 +50,72 @@ except ImportError:
 
     def hip_supported(num_heads, head_dim, kv_block_size=1):
         return False
+
+
+try:
+    from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits as flydsl_paged_logits
+except ImportError:
+    flydsl_paged_logits = None
+
+# The one instantiation FlyDSL ships: gfx950, nh=32/hd=128, the KVBlockSize=64
+# preshuffled cache, and LDS reserved for next_n <= 8.
+FLYDSL_KV_BLOCK_SIZE = 64
+FLYDSL_MAX_NEXT_N = 8
+
+# --flydsl-tune sweeps the auto split scaled by these factors: grids from 1/8 to 8x
+# the one resident wave of workgroups the auto rule aims for, clamped to the page
+# count. (Its other knob, the waves_per_eu compile hint, measured flat from 3 to 8:
+# LDS, not registers, caps occupancy at three workgroups per CU.)
+FLYDSL_SPLIT_KV_SCALES = (1 / 8, 1 / 4, 1 / 3, 1 / 2, 2 / 3, 1, 3 / 2, 2, 3, 4, 6, 8)
+
+
+def flydsl_supported(num_heads, head_dim, kv_block_size, next_n):
+    return (
+        flydsl_paged_logits is not None
+        and get_gfx() == "gfx950"
+        and (num_heads, head_dim, kv_block_size) == (32, 128, FLYDSL_KV_BLOCK_SIZE)
+        and 1 <= next_n <= FLYDSL_MAX_NEXT_N
+    )
+
+
+def flydsl_pages(context_lens):
+    max_ctx = int(context_lens.max().item())
+    return max(1, (max_ctx + FLYDSL_KV_BLOCK_SIZE - 1) // FLYDSL_KV_BLOCK_SIZE)
+
+
+def flydsl_split_kv(context_lens, batch_size):
+    """FlyDSL's own auto SplitKV rule, evaluated once outside the timed call.
+
+    Left on auto, the launcher reads ``context_lens.max().item()`` on every call.
+    run_perftest would bill that reduction and copy to FlyDSL, and the host sync
+    would space its launches out while the Triton and HIP kernels, whose hosts size
+    the grid from shapes alone, run back to back. Either skews the comparison.
+    """
+    pages = flydsl_pages(context_lens)
+    cus = torch.cuda.get_device_properties(context_lens.device).multi_processor_count
+    return max(1, min(pages, (cus * 3 + batch_size - 1) // batch_size))
+
+
+def tune_flydsl_split_kv(run, context_lens, batch_size):
+    """Time ``run(split)`` at each FLYDSL_SPLIT_KV_SCALES multiple of the auto split
+    and return the fastest; the sweep goes to the log. Every split writes the same
+    values, since it only partitions the pages, so the sweep can share the graded
+    buffer.
+    """
+    auto = flydsl_split_kv(context_lens, batch_size)
+    pages = flydsl_pages(context_lens)
+    splits = sorted(
+        {min(pages, max(1, round(auto * scale))) for scale in FLYDSL_SPLIT_KV_SCALES}
+    )
+    times = {split: run_perftest(lambda split=split: run(split))[1] for split in splits}
+    best = min(times, key=times.get)
+    aiter.logger.info(
+        "flydsl SplitKV sweep (us): %s; auto %d -> %d",
+        {split: round(float(us), 2) for split, us in times.items()},
+        auto,
+        best,
+    )
+    return best
 
 
 def calc_diff(x, y):
@@ -193,7 +268,8 @@ def _build_inputs(batch_size, next_n, heads, head_dim, avg_kv_length, block_size
 
 @benchmark()
 def test_fp8_paged_mqa_logits(batch_size, next_n, heads, head_dim, avg_kv_length,
-                              block_size, var_ratio):
+                              block_size, var_ratio, flydsl_tune=False,
+                              timing="perftest", cold=False):
     (
         q,
         q_fp8,
@@ -216,19 +292,19 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, heads, head_dim, avg_kv_length
     preshuffle = block_size > 1
     kv_kernel = preshuffle_kv_data(kv_cache_fp8, head_dim) if preshuffle else kv_cache_fp8
 
-    # Both kernels write only the causal window and leave the -inf outside it to the
-    # caller, and the Triton launcher writes in place rather than returning, so each
-    # candidate owns a pre-filled buffer that is graded after the run. Filling once
-    # is enough: every repeat writes the same window.
+    # All three kernels write only the causal window and leave the -inf outside it
+    # to the caller, and the Triton launcher writes in place rather than returning,
+    # so each candidate owns a pre-filled buffer that is graded after the run.
+    # Filling once is enough: every repeat writes the same window.
     outs = {
         name: torch.full((rows, max_model_len), float("-inf"), dtype=dtypes.fp32)
-        for name in ("triton", "hip")
+        for name in ("triton", "hip", "flydsl")
     }
 
     candidates = {
-        "triton": lambda: deepgemm_fp8_paged_mqa_logits(
+        "triton": lambda kv: deepgemm_fp8_paged_mqa_logits(
             q_fp8,
-            kv_kernel,
+            kv,
             weights,
             outs["triton"],
             context_lens,
@@ -243,15 +319,38 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, heads, head_dim, avg_kv_length
     # gfx950-only, nh=32/hd=128-only, KVBlockSize in {1, 64}; NaN cells elsewhere
     # rather than a wrong row.
     if hip_paged_logits is not None and hip_supported(heads, head_dim, block_size):
-        candidates["hip"] = lambda: hip_paged_logits(
+        candidates["hip"] = lambda kv: hip_paged_logits(
             q_fp8,
-            kv_kernel,
+            kv,
             weights,
             context_lens,
             block_tables,
             max_model_len,
             out=outs["hip"],
         )
+    # gfx950-only, nh=32/hd=128-only, KVBlockSize=64 preshuffled only, next_n <= 8.
+    flydsl_split = None
+    if flydsl_supported(heads, head_dim, block_size, next_n):
+
+        def flydsl_run(split, kv=kv_kernel):
+            return flydsl_paged_logits(
+                q_fp8,
+                kv,
+                weights,
+                outs["flydsl"],
+                context_lens,
+                block_tables,
+                max_model_len,
+                Preshuffle=preshuffle,
+                KVBlockSize=block_size,
+                SplitKV=split,
+            )
+
+        if flydsl_tune:
+            flydsl_split = tune_flydsl_split_kv(flydsl_run, context_lens, batch_size)
+        else:
+            flydsl_split = flydsl_split_kv(context_lens, batch_size)
+        candidates["flydsl"] = lambda kv: flydsl_run(flydsl_split, kv)
 
     total_ctx = int(context_lens.sum().item())
     flops = 2 * heads * head_dim * next_n * total_ctx
@@ -264,7 +363,13 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, heads, head_dim, avg_kv_length
 
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
-        _, us = run_perftest(fn)
+        # The candidates take the KV cache as an argument: run_perftest deep-copies and
+        # rotates it when num_rotate_args is 0 (--cold, enough copies to defeat the
+        # caches) and reuses it when it is 1. Every copy holds the same cache, so the
+        # graded outputs do not change. testGraph (--timing graph) times a HIP graph
+        # replay of the calls instead of the Python loop.
+        _, us = run_perftest(fn, kv_kernel, num_rotate_args=0 if cold else 1,
+                             testGraph=timing == "graph")
         out = outs[name]
         out_mask = out == float("-inf")
         assert torch.equal(out_mask, ref_mask), (
@@ -286,6 +391,8 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, heads, head_dim, avg_kv_length
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
+    if flydsl_split is not None:
+        ret["flydsl SplitKV"] = flydsl_split
     return ret
 
 
@@ -300,21 +407,40 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",
     )
-    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 4, 16, 64])
+    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 4, 16, 32, 64])
     # next_n drives ROWS_PER_BLOCK, which the host clamps to next_n; 4 and 6 are what
     # reach the R=3 instantiation that MTP decode actually runs on.
     parser.add_argument("--next-n", type=int, nargs="*", default=[1, 2, 4, 6])
-    parser.add_argument("--heads", type=int, nargs="*", default=[32, 64])
+    parser.add_argument("--heads", type=int, nargs="*", default=[32])
     parser.add_argument("--head-dim", type=int, nargs="*", default=[128])
     parser.add_argument(
         "--kv-len", type=int, nargs="*", default=[1024, 8192, 32768, 131072],
         help="average context length per sequence",
     )
-    parser.add_argument("--kv-block-size", type=int, nargs="*", default=[1, 64])
+    parser.add_argument("--kv-block-size", type=int, nargs="*", default=[64])
     parser.add_argument(
         "--var-ratio", type=float, nargs="*", default=[0.0, 0.3],
         help="context-length spread within a batch: 0 is uniform, 0.3 draws each\n"
              "sequence from +/-30%% of --kv-len (the normal serving case)",
+    )
+    parser.add_argument(
+        "--flydsl-tune", action="store_true",
+        help="sweep FlyDSL's SplitKV per case and time the fastest, instead of its\n"
+             "auto split; the sweep is logged and the pick is in 'flydsl SplitKV'",
+    )
+    parser.add_argument(
+        "--timing", choices=["perftest", "graph"], default="perftest",
+        help="perftest: run_perftest's Python loop over the calls. A launcher that is\n"
+             "slow on the host leaves the GPU idle before each call, which makes a\n"
+             "kernel of a few us look up to ~1.4x faster than back to back.\n"
+             "graph: run_perftest(testGraph=True), a HIP graph replay of the calls,\n"
+             "every kernel right behind the previous one, as in a decode step. Use it\n"
+             "to compare kernels with different launchers.",
+    )
+    parser.add_argument(
+        "--cold", action="store_true",
+        help="time every call on a KV cache that no cache holds (rotated copies), as\n"
+             "in decode, where each layer's indexer reads its own cache once per step",
     )
     args = parser.parse_args()
 
@@ -325,7 +451,9 @@ def main():
         args.kv_block_size, args.var_ratio,
     ):
         try:
-            df.append(test_fp8_paged_mqa_logits(b, nn, h, hd, kv, kvb, vr))
+            df.append(test_fp8_paged_mqa_logits(b, nn, h, hd, kv, kvb, vr,
+                                                args.flydsl_tune, args.timing,
+                                                args.cold))
         except torch.OutOfMemoryError:
             # The long-context corner needs several GiB for the cache plus one
             # output buffer per candidate. Record what was dropped rather than
