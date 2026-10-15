@@ -70,10 +70,22 @@ __device__ __forceinline__ float swap32_hi(float x) {
     return hi;
 }
 
+// K and scale loads from the paged cache. With NT the load is non-temporal: the caches do
+// not keep the line for reuse, which suits a key stream read exactly once per request (one
+// row group). With several row groups every group streams the same keys, and the later
+// groups' reads should hit the cache, so they keep ordinary loads.
+template <bool NT, typename T>
+__device__ __forceinline__ T load_kv(const fp8* p) {
+    if constexpr (NT)
+        return __builtin_nontemporal_load(reinterpret_cast<const T*>(p));
+    else
+        return *reinterpret_cast<const T*>(p);
+}
+
 // R=6's register double buffer fits 256 registers (2 waves/SIMD, what the ~2 blocks/CU
 // grid needs) only when the compiler is held to 2 waves/SIMD; uncapped it takes 272 and
 // runs 1 wave/SIMD. Held to 2 it moves the accumulator out of AGPRs, with no spill.
-template <int NUM_WARPS, int CHUNK_K, int KV_BLOCK_SIZE, int ROWS_PER_BLOCK>
+template <int NUM_WARPS, int CHUNK_K, int KV_BLOCK_SIZE, int ROWS_PER_BLOCK, bool K_NT>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, ROWS_PER_BLOCK == 6 ? 2 : 1)
 void fp8_paged_mqa_logits_kernel(
     const fp8*   __restrict__ Q_ptr,
@@ -135,7 +147,7 @@ void fp8_paged_mqa_logits_kernel(
             return base + (int64_t)off * HEAD_SIZE + d_hi * 16;
     };
     auto kv16 = [&](int blk, int token, int d_hi) -> f8x16 {
-        return *reinterpret_cast<const f8x16*>(kv_cache_ptr + kv_off(blk, token, d_hi));
+        return load_kv<K_NT, f8x16>(kv_cache_ptr + kv_off(blk, token, d_hi));
     };
     auto scale_addr = [&](int blk, int token) -> int64_t {
         const int off = token % KV_BLOCK_SIZE;
@@ -203,7 +215,8 @@ void fp8_paged_mqa_logits_kernel(
     };
 
     // R <= 6: register double buffer (R=6 relies on the launch bounds above to stay at
-    // 2 waves/SIMD). R=8 keeps the single-buffered loop.
+    // 2 waves/SIMD), R <= 2 with the next tile in flight throughout. R=8 keeps the
+    // single-buffered loop.
     constexpr bool PREFETCH = ROWS_PER_BLOCK <= 6;
     if constexpr (PREFETCH) {
         // Tile t's K and scale are loaded in the iteration before it, ahead of that
@@ -232,43 +245,131 @@ void fp8_paged_mqa_logits_kernel(
             const int token = split_start + tt * TILE_N + nA;
             #pragma unroll
             for (int i = 0; i < 4; ++i)   // 16-dim runs dhalf, 2+dhalf, 4+dhalf, 6+dhalf
-                k[i] = *reinterpret_cast<const u32x4*>(kv_cache_ptr + kv_off(blk, token, 2 * i + dhalf));
+                k[i] = load_kv<K_NT, u32x4>(kv_cache_ptr + kv_off(blk, token, 2 * i + dhalf));
         };
         auto pack_u = [&](u32x4 lo, u32x4 hi) -> f8x32 {
             f8x32 v; *reinterpret_cast<u32x4*>(&v) = lo; *(reinterpret_cast<u32x4*>(&v) + 1) = hi; return v;
         };
         auto load_scale = [&](int blk, int tt) -> float {
-            return *reinterpret_cast<const float*>(
+            return load_kv<K_NT, float>(
                 kv_cache_ptr + scale_addr(blk, split_start + tt * TILE_N + jtok));
         };
 
-        // No branch around a prefetch, not even a wave-uniform one: the compiler merges
-        // the loaded registers with the untaken path by copying them where the branch
-        // rejoins, and a copy has to wait for its load. Past the split end, the "next"
-        // tile is the current one instead (already in L2), so the loads stay unconditional.
-        auto next_of = [&](int tt) { return tt + NUM_WARPS < num_tiles ? tt + NUM_WARPS : tt; };
+        if constexpr (ROWS_PER_BLOCK <= 2) {
+            // Memory-bound: the wave always has the next tile in flight.
+            int t = warpId;
+            if (t >= num_tiles) return;
+            const int t_first = t;
+            const int t_last  = t + (num_tiles - 1 - t) / NUM_WARPS * NUM_WARPS;
+            if (t_first == t_last) {
+                // The wave's only tile: nothing to prefetch. All its loads go out in one round
+                // trip: the barrier keeps them ahead of the first MFMA, and the use at the end
+                // keeps the scale load from being sunk into the store branch, its only use.
+                u32x4 k[4];
+                load_k(kpage(t), t, k);
+                const float sc = load_scale(spage(t), t);
+                __builtin_amdgcn_sched_barrier(0);
+                compute_tile(split_start + t * TILE_N, pack_u(k[0], k[1]), pack_u(k[2], k[3]), sc);
+                asm volatile("" :: "v"(sc));
+                return;
+            }
 
-        int t = warpId;
-        if (t >= num_tiles) return;
-        u32x4 cur[4];
-        load_k(kpage(t), t, cur);
-        float kv_scale = load_scale(spage(t), t);
-        int kblk_next = kpage(next_of(t)), sblk_next = spage(next_of(t));
-        for (; t < num_tiles; t += NUM_WARPS) {
-            // The next tile's K and scale, then the page ids for the tile after it. The
-            // ids go last so that waiting for this iteration's ids never also waits for
-            // the K loads (scalar loads can only be waited for all at once).
-            const int tn = next_of(t);
-            u32x4 nxt[4];
-            load_k(kblk_next, tn, nxt);
-            const float n_scale = load_scale(sblk_next, tn);
-            kblk_next = kpage(next_of(tn));
-            sblk_next = spage(next_of(tn));
+            // A ring of NBUF tile buffers, PF of them in flight while the wave computes the
+            // other. The loop is unrolled over the ring, so the buffers take turns by position
+            // and are never copied: a copy waits for its load, and with `cur = nxt` that wait
+            // came before the next prefetch, so a waiting wave had nothing in flight. Measured
+            // against PF = 1 (graph replay, cold KV, 244 shapes at R <= 2): PF = 2 0.92x,
+            // PF = 3 0.89x; they gain nothing on long splits and lose on short ones.
+            constexpr int PF   = 1;
+            constexpr int NBUF = PF + 1;
+            // The loop runs whole turns of the ring and exits only at the bottom. An exit test
+            // after every step would be merged by the control-flow structurizer into one exit
+            // block that can branch back into the ring; along that path a step's own prefetch
+            // looks in flight at the top of the step, and the step then waits for it before
+            // prefetching, wherever the address arithmetic reuses its registers. To fill whole
+            // turns the wave starts `pad` steps before its first tile: those steps compute
+            // nothing, and their prefetches go out together with the first real ones. (Padding
+            // at the end instead leaves the wave waiting for a useless load on its way out.)
+            const int n_tiles = (t_last - t_first) / NUM_WARPS + 1;
+            const int pad     = (NBUF - n_tiles % NBUF) % NBUF;
+            t -= pad * NUM_WARPS;
+            // No branch around a prefetch, not even a wave-uniform one: the compiler merges the
+            // loaded registers with the untaken path by copying them where the branch rejoins,
+            // and a copy has to wait for its load. So a prefetch outside the wave's tiles reads
+            // the nearest of them instead (loaded anyway, so a cache hit).
+            auto ahead = [&](int tt, int k) { return min(max(tt + k * NUM_WARPS, t_first), t_last); };
 
-            compute_tile(split_start + t * TILE_N, pack_u(cur[0], cur[1]), pack_u(cur[2], cur[3]), kv_scale);
+            u32x4 kbuf[NBUF][4];
+            float sbuf[NBUF];
             #pragma unroll
-            for (int i = 0; i < 4; ++i) cur[i] = nxt[i];
-            kv_scale = n_scale;
+            for (int s = 0; s < PF; ++s) {
+                const int tp = ahead(t, s);
+                load_k(kpage(tp), tp, kbuf[s]);
+                sbuf[s] = load_scale(spage(tp), tp);
+            }
+            int kblk_next = kpage(ahead(t, PF)), sblk_next = spage(ahead(t, PF));
+            const int turns = (n_tiles + pad) / NBUF;
+            for (int turn = 0; turn < turns; ++turn) {
+                #pragma unroll
+                for (int s = 0; s < NBUF; ++s) {
+                    // Tile t + PF steps into the buffer the previous step computed from, then
+                    // the page ids one tile further. The ids go last so that waiting for them
+                    // never also waits for the K loads (scalar loads are waited for all at once).
+                    const int tp = ahead(t, PF);
+                    load_k(kblk_next, tp, kbuf[(s + PF) % NBUF]);
+                    sbuf[(s + PF) % NBUF] = load_scale(sblk_next, tp);
+                    kblk_next = kpage(ahead(t, PF + 1));
+                    sblk_next = spage(ahead(t, PF + 1));
+                    // Keeps the prefetch ahead of the MFMAs: register pressure is low here,
+                    // and the scheduler would otherwise sink the loads below them and give
+                    // two buffers the same registers.
+                    __builtin_amdgcn_sched_barrier(0);
+
+                    if (t >= t_first)                  // wave-uniform; no load inside
+                        compute_tile(split_start + t * TILE_N, pack_u(kbuf[s][0], kbuf[s][1]),
+                                     pack_u(kbuf[s][2], kbuf[s][3]), sbuf[s]);
+                    t += NUM_WARPS;
+                }
+            }
+            // A buffer's only use is in a later step's guarded compute, and the compiler would
+            // sink its loads there, past the MFMAs in between. A use on the way out keeps every
+            // load where it is issued.
+            #pragma unroll
+            for (int s = 0; s < NBUF; ++s)
+                asm volatile("" :: "v"(kbuf[s][0][0]), "v"(kbuf[s][1][0]), "v"(kbuf[s][2][0]),
+                                   "v"(kbuf[s][3][0]), "v"(sbuf[s]));
+        } else {
+            // R >= 3 is VALU-bound: a register double buffer with one tile in flight. Its
+            // copy (`cur = nxt`) waits for the next tile before that tile's successor is
+            // prefetched, which costs little here; the ring above spills at R = 6.
+            // No branch around a prefetch, not even a wave-uniform one: the compiler merges
+            // the loaded registers with the untaken path by copying them where the branch
+            // rejoins, and a copy has to wait for its load. Past the split end, the "next"
+            // tile is the current one instead (already in L2), so the loads stay unconditional.
+            auto next_of = [&](int tt) { return tt + NUM_WARPS < num_tiles ? tt + NUM_WARPS : tt; };
+
+            int t = warpId;
+            if (t >= num_tiles) return;
+            u32x4 cur[4];
+            load_k(kpage(t), t, cur);
+            float kv_scale = load_scale(spage(t), t);
+            int kblk_next = kpage(next_of(t)), sblk_next = spage(next_of(t));
+            for (; t < num_tiles; t += NUM_WARPS) {
+                // The next tile's K and scale, then the page ids for the tile after it. The
+                // ids go last so that waiting for this iteration's ids never also waits for
+                // the K loads (scalar loads can only be waited for all at once).
+                const int tn = next_of(t);
+                u32x4 nxt[4];
+                load_k(kblk_next, tn, nxt);
+                const float n_scale = load_scale(sblk_next, tn);
+                kblk_next = kpage(next_of(tn));
+                sblk_next = spage(next_of(tn));
+
+                compute_tile(split_start + t * TILE_N, pack_u(cur[0], cur[1]), pack_u(cur[2], cur[3]), kv_scale);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) cur[i] = nxt[i];
+                kv_scale = n_scale;
+            }
         }
     } else {
         int blk_cur = load_blk(warpId);
@@ -287,7 +388,7 @@ void fp8_paged_mqa_logits_kernel(
             int blk_s = blk_cur;
             if constexpr (KV_BLOCK_SIZE == 1) blk_s = (stoken < ctx_len) ? bt[stoken] : -1;
             const float kv_scale = (stoken < ctx_len && blk_s >= 0)
-                ? *reinterpret_cast<const float*>(kv_cache_ptr + scale_addr(blk_s, stoken)) : 0.0f;
+                ? load_kv<K_NT, float>(kv_cache_ptr + scale_addr(blk_s, stoken)) : 0.0f;
             blk_cur = blk_next;
 
             compute_tile(token_base, vB0, vB1, kv_scale);
@@ -299,25 +400,48 @@ void fp8_paged_mqa_logits_kernel(
 // ============================================================================
 // Host dispatch
 // ============================================================================
+// Non-temporal loads are only chosen at R <= 2 (see the heuristic), so only those
+// R are instantiated with them.
+template <int NW, int CK, int KB, int R>
+static void launch_fp8_paged_mqa_logits(
+    bool k_nt, dim3 grid, hipStream_t stream,
+    const fp8* d_q, const fp8* d_kv, const float* d_w,
+    const int* d_ctx, const int* d_bt, float* d_out,
+    int batch_size, int next_n,
+    int max_blocks_per_seq, int max_model_len, int index_dim, int SplitKV
+) {
+    if constexpr (R <= 2) {
+        if (k_nt) {
+            mqa_paged::fp8_paged_mqa_logits_kernel<NW, CK, KB, R, true>
+                <<<grid, NW * WARP_SIZE, 0, stream>>>(
+                    d_q, d_kv, d_w, d_ctx, d_bt, d_out,
+                    batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
+            return;
+        }
+    }
+    mqa_paged::fp8_paged_mqa_logits_kernel<NW, CK, KB, R, false>
+        <<<grid, NW * WARP_SIZE, 0, stream>>>(
+            d_q, d_kv, d_w, d_ctx, d_bt, d_out,
+            batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
+}
+
 static void dispatch_fp8_paged_mqa_logits(
     const fp8* d_q, const fp8* d_kv, const float* d_w,
     const int* d_ctx, const int* d_bt, float* d_out,
     int batch_size, int next_n,
     int max_blocks_per_seq, int max_model_len, int index_dim,
     int ChunkK, int SplitKV, int num_warps, int kv_block_size,
-    int rows_per_block, hipStream_t stream
+    int rows_per_block, bool k_nt, hipStream_t stream
 ) {
     // grid = dim3(batch, SplitKV, num_groups). Each block owns ROWS_PER_BLOCK
     // (=R) consecutive next_n rows; num_groups = ceil(next_n / R).
     const int num_groups = CDIV(next_n, rows_per_block);
-
     const dim3 grid = dim3(batch_size, SplitKV, num_groups);
 
     #define LAUNCH(NW, CK, KB, R)                                                       \
-        mqa_paged::fp8_paged_mqa_logits_kernel<NW, CK, KB, R>                          \
-            <<<grid, NW * WARP_SIZE, 0, stream>>>(                                       \
-                d_q, d_kv, d_w, d_ctx, d_bt, d_out,                                      \
-                batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
+        launch_fp8_paged_mqa_logits<NW, CK, KB, R>(                                     \
+            k_nt, grid, stream, d_q, d_kv, d_w, d_ctx, d_bt, d_out,                     \
+            batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
 
     // R folds in as a compile-time constant so q_reg/w_reg stay in registers.
     #define LAUNCH_NN(NW, CK, KB)                                                       \
@@ -418,7 +542,7 @@ torch::Tensor fp8_paged_mqa_logits(
     //                 The grid fills 2 waves/SIMD, which R=4 (192 regs) and R=6
     //                 (256) still fit, so the larger R costs no occupancy here.
     //   CHUNK_K = 128 for long ctx (more splittable tiles) or R=1; else 256.
-    //   num_warps = 8 except the tiny R=1 case (4).
+    //   num_warps = 4.
     const int mml_i = static_cast<int>(max_model_len);
     const int64_t tot = (int64_t)batch_size * mml_i;
 
@@ -428,8 +552,7 @@ torch::Tensor fp8_paged_mqa_logits(
     int split_kv_i     = static_cast<int>(SplitKV);
 
     // Fitted against a 35-shape tuning sweep.
-    // num_warps=4 is the broad optimum, with 8 only in a mid band; large total
-    // footprints want the small chunk.
+    // Large total footprints want the small chunk.
     if (rows_per_block <= 0) {
         rows_per_block = (tot < 90000) ? 1 : (tot < 280000 ? 2 : 3);
         if (rows_per_block == 3) {
@@ -445,7 +568,16 @@ torch::Tensor fp8_paged_mqa_logits(
     // kernel skips rows past next_n.
     if (rows_per_block > next_n)
         rows_per_block = next_n <= 4 ? next_n : (next_n <= 6 ? 6 : 8);
-    if (num_warps_i <= 0) num_warps_i = (tot >= 80000 && tot < 280000) ? 8 : 4;
+    // num_warps = 8 used to win in the band 80K <= tot < 280K, before the register
+    // double buffer. There, with SplitKV filling ~2 blocks/CU, it gives every wave a
+    // single 32-token tile (b1 x 128K: 4096 waves), and each wave pays the whole
+    // prologue and the Q/weight loads for 4 KB of K. With 4 warps a wave takes two
+    // tiles, and the double buffer has both in flight at once. Measured 4 vs 8 (HIP
+    // graph replay, cold KV): b1 128K, b4 32K, b16 8K at next_n 1-6 1.10-1.30x;
+    // b64 1K at next_n 2-6 1.08-1.29x, next_n 1 0.94x. Fewer splits for more tiles
+    // per wave lose: at next_n 1, SplitKV for ~1 block/CU is 1.09-1.23x slower and
+    // for ~0.5 blocks/CU 1.55-1.84x (shapes above 5 us).
+    if (num_warps_i <= 0) num_warps_i = 4;
     if (chunk_k_i   <= 0)
         chunk_k_i = (mml_i >= 50000) ? (tot >= 400000 ? 64 : 128)
                                      : (tot < 280000 ? 256 : 64);
@@ -458,6 +590,15 @@ torch::Tensor fp8_paged_mqa_logits(
         split_kv_i = std::max(1, std::min(ctx_chunks_ub,
             (target_blocks + units - 1) / units));
     }
+
+    // Non-temporal K and scale loads where each request's keys are fetched exactly once
+    // (one row group; with more, the groups share the key stream through the cache), the
+    // kernel is bound by that stream (R <= 2; at R = 4 and 6 it is VALU-bound), and the
+    // stream is large (tot >= 280K). Measured against plain loads (graph replay, cold KV,
+    // one row group): from tot 512K R=1 1.06x, R=2 1.03x, R=4/6 0.995-0.997x; at tot
+    // 128K-256K, where the keys fit the last-level cache, 0.97x.
+    const int num_groups = (next_n + rows_per_block - 1) / rows_per_block;
+    const bool k_nt = num_groups == 1 && rows_per_block <= 2 && tot >= 280000;
 
     // The kernel writes only the causal window, so the -inf outside it is the
     // caller's -- same contract as deepgemm_fp8_paged_mqa_logits. When no buffer is
@@ -486,7 +627,7 @@ torch::Tensor fp8_paged_mqa_logits(
         batch_size, next_n, max_blocks_per_seq,
         static_cast<int>(max_model_len), index_dim,
         chunk_k_i, split_kv_i,
-        num_warps_i, kv_block_size, rows_per_block, stream);
+        num_warps_i, kv_block_size, rows_per_block, k_nt, stream);
 
     return out_logits;
 }
