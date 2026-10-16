@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Decode-phase FP8 paged MQA indexer logits kernel, gfx950.
 #include "fp8_paged_mqa_logits.h"
+#include <type_traits>
 
 // ============================================================================
 // fp8_paged_mqa_logits — decode-phase indexer kernel (GLM-5-FP8), CDNA4 / gfx950
@@ -82,9 +83,33 @@ __device__ __forceinline__ T load_kv(const fp8* p) {
         return *reinterpret_cast<const T*>(p);
 }
 
-// R=6's register double buffer fits 256 registers (2 waves/SIMD, what the ~2 blocks/CU
-// grid needs) only when the compiler is held to 2 waves/SIMD; uncapped it takes 272 and
-// runs 1 wave/SIMD. Held to 2 it moves the accumulator out of AGPRs, with no spill.
+// K staged in LDS by DMA (the R >= 3 ring in the kernel). One wave's 32-token K tile as the DMA
+// lands it: lane l's four 16-byte chunks at k[i][l].
+struct KTileLds {
+    u32x4 k[4][WARP_SIZE];
+};
+using lds_void    = __attribute__((address_space(3))) void;
+using KTileLdsPtr = __attribute__((address_space(3))) KTileLds*;
+
+// Slot SLOT of wave `wave`'s ring. Every slot is a __shared__ object of its own, so the compiler
+// tracks the DMAs into each apart (one alias scope per object) and waits before a slot's reads
+// for that slot's DMAs only. With one object for the whole ring this compiler (roc-7.2.3) emits
+// no wait at all and the reads race the DMAs; it tracks at most 8 such objects.
+template <int SLOT, int NUM_WARPS>
+__device__ __forceinline__ KTileLdsPtr k_slot(int wave) {
+    __shared__ KTileLds ring[NUM_WARPS];
+    return (KTileLdsPtr)&ring[wave];
+}
+
+// Raw buffer resource word 3 on gfx950, and an s_waitcnt immediate (gfx9 field layout; a plain
+// count of 16 or more passed to __builtin_amdgcn_s_waitcnt is mis-encoded).
+constexpr int BUF_RSRC_WORD3 = 0x00020000;
+#define WAITCNT_IMM(vm, exp, lgkm) \
+    (((vm) & 0xF) | (((exp) & 0x7) << 4) | (((lgkm) & 0xF) << 8) | ((((vm) >> 4) & 0x3) << 14))
+
+// R=6's register double buffer (KV_BLOCK_SIZE=1) fits 256 registers (2 waves/SIMD, what the
+// ~2 blocks/CU grid needs) only when the compiler is held to 2 waves/SIMD; uncapped it takes 272
+// and runs 1 wave/SIMD. Held to 2 it moves the accumulator out of AGPRs, with no spill.
 template <int NUM_WARPS, int CHUNK_K, int KV_BLOCK_SIZE, int ROWS_PER_BLOCK, bool K_NT>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, ROWS_PER_BLOCK == 6 ? 2 : 1)
 void fp8_paged_mqa_logits_kernel(
@@ -214,9 +239,9 @@ void fp8_paged_mqa_logits_kernel(
         }
     };
 
-    // R <= 6: register double buffer (R=6 relies on the launch bounds above to stay at
-    // 2 waves/SIMD), R <= 2 with the next tile in flight throughout. R=8 keeps the
-    // single-buffered loop.
+    // R <= 6 prefetch: R <= 2 a register ring with the next tile in flight throughout; R >= 3 an
+    // LDS ring (KV_BLOCK_SIZE=64), else a register double buffer (R=6 relies on the launch bounds
+    // above to stay at 2 waves/SIMD). R=8 keeps the single-buffered loop.
     constexpr bool PREFETCH = ROWS_PER_BLOCK <= 6;
     if constexpr (PREFETCH) {
         // Tile t's K and scale are loaded in the iteration before it, ahead of that
@@ -255,7 +280,106 @@ void fp8_paged_mqa_logits_kernel(
                 kv_cache_ptr + scale_addr(blk, split_start + tt * TILE_N + jtok));
         };
 
-        if constexpr (ROWS_PER_BLOCK <= 2) {
+        constexpr bool LDS_RING = PRESHUFFLE && ROWS_PER_BLOCK >= 3;
+        if constexpr (LDS_RING) {
+            // R >= 3: K staged in LDS. At these R the rows' Q and weights leave no registers for
+            // a second K tile, and the register double buffer below has to copy it, which waits
+            // for its load before the next prefetch: one tile in flight. Here each wave DMAs its
+            // own tiles into a ring of NBUF slots of its own (no wave reads another's, so no
+            // barrier), PF = NBUF - 1 tiles ahead, and reads the current one back just before its
+            // MFMAs, so the next tile is always in flight. Measured against that loop (graph
+            // replay, cold KV, the 84 benchmark shapes at R >= 3): NBUF 2 1.061x (R=3 1.126x,
+            // R=4 1.039x, R=6 1.038x, none slower), 3 1.052x, 4 1.027x; deeper rings gain ~2% on
+            // waves of 32+ tiles and lose up to 8% on short ones. At R <= 2 (the register ring
+            // above keeps two tiles in flight) no depth gained.
+            constexpr int NBUF = 2;
+            constexpr int PF   = NBUF - 1;
+            static_assert(NBUF <= 4, "up to 4 ring slots");
+            static_assert(KV_BLOCK_SIZE == 2 * TILE_N && NUM_WARPS % 2 == 0 && CHUNK_K % KV_BLOCK_SIZE == 0,
+                          "the lane offsets need two tiles per page, page-aligned splits and an even NUM_WARPS");
+            int t = warpId;
+            if (t >= num_tiles) return;
+            const int t_first = t;
+            const int t_last  = t + (num_tiles - 1 - t) / NUM_WARPS * NUM_WARPS;
+            // Whole turns of the ring, padded at the start: those steps only prefetch.
+            const int n_tiles = (t_last - t_first) / NUM_WARPS + 1;
+            const int pad     = (NBUF - n_tiles % NBUF) % NBUF;
+            t -= pad * NUM_WARPS;
+
+            // A wave's tiles all sit in the same half of their pages (split_start is a multiple of
+            // CHUNK_K >= 64 and NUM_WARPS is even), so its lanes' offsets in a page never change.
+            const int half = (warpId & 1) * TILE_N;
+            const int ktok = half + nA;
+            int k_voff[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)       // 16-dim runs dhalf, 2+dhalf, 4+dhalf, 6+dhalf
+                k_voff[i] = (2 * i + dhalf) * 256 + (ktok & 15) * 16 + (ktok >> 4) * 16 * HEAD_SIZE;
+            const int s_voff = KV_BLOCK_SIZE * HEAD_SIZE + (half + jtok) * 4;
+            const int64_t page_bytes = (int64_t)KV_BLOCK_SIZE * index_dim;
+            auto in_range = [&](int tt) { return tt >= t_first && tt <= t_last; };
+            auto page_of  = [&](int tt) {     // clamped into the wave's tiles: a valid entry
+                return bt[(split_start + min(max(tt, t_first), t_last) * TILE_N) / KV_BLOCK_SIZE];
+            };
+            constexpr int K_AUX = K_NT ? 2 : 0;   // nt
+            // One tile: its four 1 KB K chunks into a slot by DMA, its scale into a register, both
+            // through a resource over the tile's page. A tile outside the wave's range gets
+            // num_records 0: its loads return zeros and read no memory, and it is never computed.
+            // (The scale stays a register load on purpose: a loop whose loads all go to LDS makes
+            // the compiler flush vmcnt before it, for Q and the weights, and that waits for the
+            // ring's first DMAs too.)
+            auto load_tile = [&](int page, bool valid, KTileLdsPtr sl) -> float {
+                const __amdgpu_buffer_rsrc_t rs = __builtin_amdgcn_make_buffer_rsrc(
+                    (void*)(kv_cache_ptr + page * page_bytes), (short)0, valid ? (int)page_bytes : 0,
+                    BUF_RSRC_WORD3);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    __builtin_amdgcn_raw_ptr_buffer_load_lds(rs, (lds_void*)&sl->k[i][0], 16, k_voff[i], 0, 0, K_AUX);
+                return __builtin_bit_cast(float, __builtin_amdgcn_raw_buffer_load_b32(rs, s_voff, 0, K_AUX));
+            };
+
+            // The prologue's loads go out in ring order, after Q and the weights, exactly as the
+            // loop issues them, so the waits the loop needs are the same on its first turn.
+            float sbuf[NBUF];
+            __builtin_amdgcn_sched_barrier(0);
+            sbuf[0] = load_tile(page_of(t), in_range(t), k_slot<0, NUM_WARPS>(warpId));
+            if constexpr (PF > 1)
+                sbuf[1] = load_tile(page_of(t + NUM_WARPS), in_range(t + NUM_WARPS), k_slot<1, NUM_WARPS>(warpId));
+            if constexpr (PF > 2)
+                sbuf[2] = load_tile(page_of(t + 2 * NUM_WARPS), in_range(t + 2 * NUM_WARPS), k_slot<2, NUM_WARPS>(warpId));
+            __builtin_amdgcn_sched_barrier(0);
+            int page_next = page_of(t + PF * NUM_WARPS);
+            auto step = [&](auto slot_c) {
+                constexpr int S = decltype(slot_c)::value;
+                const int tp = t + PF * NUM_WARPS;
+                // WAR: the slot about to be refilled was read a step ago, and a DMA write can
+                // overtake a queued ds_read of the same address; the compiler does not guard it.
+                // The page id's scalar load needs this wait anyway.
+                __builtin_amdgcn_s_waitcnt(WAITCNT_IMM(63, 7, 0));
+                __builtin_amdgcn_sched_barrier(0);
+                sbuf[(S + PF) % NBUF] = load_tile(page_next, in_range(tp), k_slot<(S + PF) % NBUF, NUM_WARPS>(warpId));
+                page_next = page_of(tp + NUM_WARPS);
+                // Keeps the DMAs ahead of this step's reads: unpinned, the scheduler moves the
+                // next step's reads up behind them, and then they wait for these DMAs too.
+                __builtin_amdgcn_sched_barrier(0);
+                if (t >= t_first) {               // wave-uniform; no DMA inside
+                    const KTileLdsPtr sl = k_slot<S, NUM_WARPS>(warpId);
+                    compute_tile(split_start + t * TILE_N, pack_u(sl->k[0][l], sl->k[1][l]),
+                                 pack_u(sl->k[2][l], sl->k[3][l]), sbuf[S]);
+                }
+                t += NUM_WARPS;
+            };
+            // At least one turn always runs. A guarded loop entry would let the compiler sink the
+            // prologue's loads past the guard, behind Q and the weights, and the merged waits at
+            // the loop head then drain the next tile once per turn.
+            const int turns = (n_tiles + pad) / NBUF;
+            int turn = 0;
+            do {
+                step(std::integral_constant<int, 0>{});
+                step(std::integral_constant<int, 1>{});
+                if constexpr (NBUF > 2) step(std::integral_constant<int, 2>{});
+                if constexpr (NBUF > 3) step(std::integral_constant<int, 3>{});
+            } while (++turn < turns);
+        } else if constexpr (ROWS_PER_BLOCK <= 2) {
             // Memory-bound: the wave always has the next tile in flight.
             int t = warpId;
             if (t >= num_tiles) return;
@@ -339,9 +463,10 @@ void fp8_paged_mqa_logits_kernel(
                 asm volatile("" :: "v"(kbuf[s][0][0]), "v"(kbuf[s][1][0]), "v"(kbuf[s][2][0]),
                                    "v"(kbuf[s][3][0]), "v"(sbuf[s]));
         } else {
-            // R >= 3 is VALU-bound: a register double buffer with one tile in flight. Its
+            // KV_BLOCK_SIZE=1 at R >= 3: a register double buffer with one tile in flight. Its
             // copy (`cur = nxt`) waits for the next tile before that tile's successor is
-            // prefetched, which costs little here; the ring above spills at R = 6.
+            // prefetched. A register ring spills at R = 6, and the LDS ring needs 64-token pages
+            // (its lane offsets stay fixed within a page).
             // No branch around a prefetch, not even a wave-uniform one: the compiler merges
             // the loaded registers with the untaken path by copying them where the branch
             // rejoins, and a copy has to wait for its load. Past the split end, the "next"
