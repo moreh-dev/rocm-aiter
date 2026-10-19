@@ -104,6 +104,9 @@ __device__ __forceinline__ KTileLdsPtr k_slot(int wave) {
 // Raw buffer resource word 3 on gfx950, and an s_waitcnt immediate (gfx9 field layout; a plain
 // count of 16 or more passed to __builtin_amdgcn_s_waitcnt is mis-encoded).
 constexpr int BUF_RSRC_WORD3 = 0x00020000;
+// voffset of a dropped buffer store: past any row's num_records, and the bit pattern of 4.0f, so it
+// is an inline constant (no register).
+constexpr int OOB_VOFFSET    = 0x40800000;
 #define WAITCNT_IMM(vm, exp, lgkm) \
     (((vm) & 0xF) | (((exp) & 0x7) << 4) | (((lgkm) & 0xF) << 8) | ((((vm) >> 4) & 0x3) << 14))
 
@@ -152,6 +155,9 @@ void fp8_paged_mqa_logits_kernel(
     const int jtok  = l % 32;                  // output token index
     const int hset  = l / 32;                  // output head-set (0/1)
 
+    // PIPE (the R >= 3 LDS ring): a tile's rows run as one straight block, software-pipelined so
+    // that no row's reduction waits out its own MFMA latency (see pipe_tile).
+    constexpr bool PIPE = PRESHUFFLE && ROWS_PER_BLOCK >= 3 && ROWS_PER_BLOCK <= 6;
     f8x32 q_reg[ROWS_PER_BLOCK][2];            // [row][MFMA# (dims 0-63 / 64-127)]
     float w_reg[ROWS_PER_BLOCK][NACC];         // weights for this lane's 16 output heads
 
@@ -192,9 +198,12 @@ void fp8_paged_mqa_logits_kernel(
     // ---- Q → registers; W → registers (16 output heads for this lane) ----
     #pragma unroll
     for (int r = 0; r < ROWS_PER_BLOCK; ++r) {
-        if (row_start + r >= next_n) break;
+        // PIPE: a row past next_n loads the last row and is masked at the store, so every row
+        // runs the same straight-line code.
+        if (!PIPE && row_start + r >= next_n) break;
+        const int qrow = q_row0 + (PIPE ? min(r, next_n - 1 - row_start) : r);
         const int head = nA;                                     // input M index
-        const int qb = (q_row0 + r) * NUM_HEADS * HEAD_SIZE + head * HEAD_SIZE;
+        const int qb = qrow * NUM_HEADS * HEAD_SIZE + head * HEAD_SIZE;
         q_reg[r][0] = pack(*reinterpret_cast<const f8x16*>(&Q_ptr[qb + dhalf * 16]),
                            *reinterpret_cast<const f8x16*>(&Q_ptr[qb + (2 + dhalf) * 16]));
         q_reg[r][1] = pack(*reinterpret_cast<const f8x16*>(&Q_ptr[qb + (4 + dhalf) * 16]),
@@ -202,7 +211,7 @@ void fp8_paged_mqa_logits_kernel(
         #pragma unroll
         for (int v = 0; v < NACC; ++v) {
             const int i = 8 * (v / 4) + 4 * hset + (v % 4);      // output head for this vgpr
-            w_reg[r][v] = weights_ptr[(q_row0 + r) * NUM_HEADS + i];
+            w_reg[r][v] = weights_ptr[qrow * NUM_HEADS + i];
         }
     }
 
@@ -237,6 +246,44 @@ void fp8_paged_mqa_logits_kernel(
                     logits_ptr[(int64_t)(q_row0 + r) * max_model_len + abs_pos] = partial;
             }
         }
+    };
+
+    // PIPE pieces. One row's MFMAs, its reduction, and a store without a branch (a lane outside the
+    // causal window, or of a row past next_n, stores to an out-of-range offset, which the hardware
+    // drops): a branch would cut the tile into one block per row, and the scheduler only reorders
+    // within a block.
+    auto mfma_row = [&](int r, const f8x32& vB0, const f8x32& vB1) -> VecOutMFMA {
+        VecOutMFMA vC = {};
+        vC = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+            q_reg[r][0], vB0, vC, 0, 0, 0, UNIT_SCALE, 0, UNIT_SCALE);
+        vC = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+            q_reg[r][1], vB1, vC, 0, 0, 0, UNIT_SCALE, 0, UNIT_SCALE);
+        return vC;
+    };
+    auto reduce_row = [&](const VecOutMFMA& vC, int r, float kv_scale) -> float {
+        // An explicit fma: with the rows pipelined, the plain expression came out as packed
+        // v_pk_mul_f32 + v_add_f32 pairs, each add 1 wait state behind its multiply.
+        float partial = 0.0f;
+        #pragma unroll
+        for (int v = 0; v < NACC; ++v)
+            partial = __builtin_fmaf(relu_fast(vC[v]), w_reg[r][v], partial);
+        return (partial + swap32_hi(partial)) * kv_scale;
+    };
+    __amdgpu_buffer_rsrc_t o_rsrc[ROWS_PER_BLOCK];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_BLOCK; ++r)
+        o_rsrc[r] = __builtin_amdgcn_make_buffer_rsrc(
+            (void*)(logits_ptr + (int64_t)(q_row0 + r) * max_model_len), (short)0, max_model_len * 4,
+            BUF_RSRC_WORD3);
+    const int jcmp = (l < 32) ? jtok : (1 << 30);   // lanes 32-63 hold no logit
+    const int joff = jtok * 4;
+    auto store_row = [&](int r, int token_base, float val, bool ok) {
+        const int causal_limit = ctx_len - next_n + row_start + r;   // < ctx_len
+        // the row's last position in the window, relative to the tile
+        const int lim = min(causal_limit, max_model_len - 1) - token_base;
+        const bool keep = ok && row_start + r < next_n && jcmp <= lim;
+        __builtin_amdgcn_raw_buffer_store_b32(__builtin_bit_cast(unsigned, val), o_rsrc[r],
+                                              keep ? joff : OOB_VOFFSET, token_base * 4, 0);
     };
 
     // R <= 6 prefetch: R <= 2 a register ring with the next tile in flight throughout; R >= 3 an
@@ -348,6 +395,28 @@ void fp8_paged_mqa_logits_kernel(
                 sbuf[2] = load_tile(page_of(t + 2 * NUM_WARPS), in_range(t + 2 * NUM_WARPS), k_slot<2, NUM_WARPS>(warpId));
             __builtin_amdgcn_sched_barrier(0);
             int page_next = page_of(t + PF * NUM_WARPS);
+            // The rows of all the wave's tiles software-pipelined. Row r's reduction goes after
+            // row r+1's MFMAs; a tile's last row is reduced after the next tile's first-row MFMAs
+            // (the carry), so no reduction waits out its own MFMA latency.
+            VecOutMFMA carry = {};
+            float carry_scale = 0.0f;
+            int carry_base = 0;
+            bool have_carry = false;
+            auto pipe_tile = [&](int token_base, const f8x32& vB0, const f8x32& vB1, float kv_scale) {
+                VecOutMFMA acc = mfma_row(0, vB0, vB1);
+                store_row(ROWS_PER_BLOCK - 1, carry_base,
+                          reduce_row(carry, ROWS_PER_BLOCK - 1, carry_scale), have_carry);
+                #pragma unroll
+                for (int r = 1; r < ROWS_PER_BLOCK; ++r) {
+                    const VecOutMFMA nacc = mfma_row(r, vB0, vB1);
+                    store_row(r - 1, token_base, reduce_row(acc, r - 1, kv_scale), true);
+                    acc = nacc;
+                }
+                carry = acc;
+                carry_scale = kv_scale;
+                carry_base = token_base;
+                have_carry = true;
+            };
             auto step = [&](auto slot_c) {
                 constexpr int S = decltype(slot_c)::value;
                 const int tp = t + PF * NUM_WARPS;
@@ -363,8 +432,8 @@ void fp8_paged_mqa_logits_kernel(
                 __builtin_amdgcn_sched_barrier(0);
                 if (t >= t_first) {               // wave-uniform; no DMA inside
                     const KTileLdsPtr sl = k_slot<S, NUM_WARPS>(warpId);
-                    compute_tile(split_start + t * TILE_N, pack_u(sl->k[0][l], sl->k[1][l]),
-                                 pack_u(sl->k[2][l], sl->k[3][l]), sbuf[S]);
+                    pipe_tile(split_start + t * TILE_N, pack_u(sl->k[0][l], sl->k[1][l]),
+                              pack_u(sl->k[2][l], sl->k[3][l]), sbuf[S]);
                 }
                 t += NUM_WARPS;
             };
@@ -379,6 +448,9 @@ void fp8_paged_mqa_logits_kernel(
                 if constexpr (NBUF > 2) step(std::integral_constant<int, 2>{});
                 if constexpr (NBUF > 3) step(std::integral_constant<int, 3>{});
             } while (++turn < turns);
+            // the wave's last tile's last row
+            store_row(ROWS_PER_BLOCK - 1, carry_base,
+                      reduce_row(carry, ROWS_PER_BLOCK - 1, carry_scale), have_carry);
         } else if constexpr (ROWS_PER_BLOCK <= 2) {
             // Memory-bound: the wave always has the next tile in flight.
             int t = warpId;
