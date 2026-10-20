@@ -8,7 +8,7 @@
 // K is already gathered into a contiguous [N, 128] fp8 buffer with an [N] fp32 scale (no block table).
 // Same contract as aiter.ops.triton.attention.fp8_mqa_logits.
 //
-// Design (MV-5041 "v35w"):
+// Design (MV-5041 "v35wes"):
 //   * workgroup = 8 waves x 4 rows = 32 query rows; Q and w live in VGPRs, all waves walk the SAME K sequence,
 //     so K is read from L2/HBM once per 32 rows.
 //   * K stage = 2 x 32 tokens x 128 B staged in LDS (2-stage ring, bank-conflict-free swizzle), kv_scale staged
@@ -20,6 +20,9 @@
 //   * head reduction with v_permlane32_swap (inline asm: the clang builtin miscompiles its 2nd result on
 //     ROCm 7.2.3), kv_scale applied once after the reduction, raw buffer stores; the add/mul/store tail of each
 //     row pair is deferred by one sub-tile so it fills the MFMA->VALU hazard window (no s_nop in the loop).
+//   * one s_barrier per stage, placed early (right after the last ds_read of the current stage) plus
+//     a per-stage s_setprio staircase, so the two waves of a SIMD reach the barrier together instead of the older
+//     wave idling there ~1/3 of every stage.
 //   * per-WG stage range split into CLEAN stages (all 32 rows valid on every token: no compare/select) and MASKED
 //     boundary stages; both ranges are shared across grid.y = SplitN workgroups. -inf outside [ks, ke) is written
 //     by the kernel itself when clean_logits (no separate torch.full pass).
@@ -50,7 +53,7 @@ constexpr int HEAD_SIZE = 128;
 #define BUF_RSRC_WORD3 0x00020000
 #define SYNC_TILE() __syncthreads()
 
-namespace mqa_v35w {
+namespace mqa_v35wes {
 
 using f8x16 = __attribute__((__vector_size__(16))) fp8;
 using f8x32 = __attribute__((__vector_size__(32))) fp8;
@@ -371,9 +374,10 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
 //   a3 | RD_NEXT ds_reads                  | epi row 2 h0      b3 | epi row 2 h1
 //   a0+| p1 = e1 + o1, p2 = e2 + o2         | epi row 3 h0      b0+| permlane(p0, p1) | epi row 3 h1
 // (' = previous sub-tile). Every permlane input was written >= 2 instructions earlier (VALU -> permlane hazard).
-#define SUBTILE(BC, BN, TOKBASE, RD_NEXT, MK, PEND) \
+#define SUBTILE(BC, BN, TOKBASE, RD_NEXT, MK, PEND, PS, PM, RD_LATE) \
     { \
         float e0, o0, e1, o1, e2, o2; \
+        if constexpr ((PS) >= 0) __builtin_amdgcn_s_setprio(PS); \
         mfma_a(1, Bo[BC], acc[1]); \
         __builtin_amdgcn_sched_barrier(0); \
         float pd_p3 = 0.f; \
@@ -401,11 +405,13 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
         __builtin_amdgcn_sched_barrier(0); \
         mfma_a(3, Bo[BC], acc[1]); \
         __builtin_amdgcn_sched_barrier(0); \
+        if constexpr ((PM) >= 0) __builtin_amdgcn_s_setprio(PM); \
         RD_NEXT; \
         epi_half(2, acc[0], IC<0>{}, e2, o2); \
         __builtin_amdgcn_sched_barrier(0); \
         mfma_b(3, Bo[BC], acc[1]); \
         __builtin_amdgcn_sched_barrier(0); \
+        RD_LATE; \
         epi_half(2, acc[0], IC<1>{}, e2, o2); \
         __builtin_amdgcn_sched_barrier(0); \
         mfma_a(0, Bo[BN], acc[0]); \
@@ -424,20 +430,29 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
         pd_tok = TOKBASE; \
         __builtin_amdgcn_sched_barrier(0); \
     }
-    // one LDS stage: SUB sub-tiles; barrier before reading the next stage's first sub-tile
+    // one LDS stage: SUB sub-tiles.
+    // Early barrier: the stage barrier only has to follow (RAW) the stage-start ds_write of NXT and (WAR) the last
+    // ds_read of CUR, so it sits after MFMA b(3) of the sub-tile that issues that last CUR read. The next-stage
+    // operand read of the last sub-tile is then a plain ds_read after a(3), its latency covered by epi(2) + b(3)
+    // like every other sub-tile. At pipeline exit only the dummy NXT read follows the last barrier (result unused).
+    // Priority staircase: barrier-to-barrier = last sub-tile of a stage, then the first sub-tile of the next one;
+    // every wave steps s_setprio 3 -> 2 -> 1 -> 0 along that span (PS at sub-tile start, PM after a(3)), so the
+    // leading wave (normally the older one, which wins issue arbitration) yields the issue port to the lagging
+    // wave and both reach the barrier together instead of one idling ~1/3 of the stage. -1 = no s_setprio.
+#define NEXT_STAGE_READ(NXT) read_lds(Bo[0], IC<NXT>{}, IC<0>{})
 #define STAGE_STEP(CUR, NXT, WS, TT, MK, WC, P0)                                                          \
     {                                                                                                     \
         const int stage_base = __builtin_amdgcn_readfirstlane(tokbase(TT));                      \
         write_lds(IC<WS>{}, IC<NXT>{}, IC<WC>{});                                                        \
         issue_loads(min((TT) + PF + 1, te - 1), IC<WS>{});                                             \
         if constexpr (SUB == 2) {                                                                         \
-            SUBTILE(0, 1, stage_base, read_lds(Bo[1], IC<CUR>{}, IC<1>{}), MK, P0)   \
-            SUBTILE(1, 0, stage_base + TILE_N, (SYNC_TILE(), read_lds(Bo[0], IC<NXT>{}, IC<0>{})), MK, true) \
+            SUBTILE(0, 1, stage_base, read_lds(Bo[1], IC<CUR>{}, IC<1>{}), MK, P0, 1, 0, SYNC_TILE())   \
+            SUBTILE(1, 0, stage_base + TILE_N, NEXT_STAGE_READ(NXT), MK, true, 3, 2, (void)0) \
         } else {                                                                                          \
-            SUBTILE(0, 1, stage_base, read_lds(Bo[1], IC<CUR>{}, IC<1>{}), MK, P0)   \
-            SUBTILE(1, 0, stage_base + TILE_N, read_lds(Bo[0], IC<CUR>{}, IC<2>{}), MK, true)   \
-            SUBTILE(0, 1, stage_base + 2 * TILE_N, read_lds(Bo[1], IC<CUR>{}, IC<3>{}), MK, true)   \
-            SUBTILE(1, 0, stage_base + 3 * TILE_N, (SYNC_TILE(), read_lds(Bo[0], IC<NXT>{}, IC<0>{})), MK, true) \
+            SUBTILE(0, 1, stage_base, read_lds(Bo[1], IC<CUR>{}, IC<1>{}), MK, P0, 1, -1, (void)0)   \
+            SUBTILE(1, 0, stage_base + TILE_N, read_lds(Bo[0], IC<CUR>{}, IC<2>{}), MK, true, 0, -1, (void)0)   \
+            SUBTILE(0, 1, stage_base + 2 * TILE_N, read_lds(Bo[1], IC<CUR>{}, IC<3>{}), MK, true, 3, -1, SYNC_TILE())   \
+            SUBTILE(1, 0, stage_base + 3 * TILE_N, NEXT_STAGE_READ(NXT), MK, true, 2, -1, (void)0) \
         }                                                                                                 \
     }
 
@@ -479,6 +494,7 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
     FLUSH_PEND();
     }
 #undef STAGE_STEP
+#undef NEXT_STAGE_READ
 #undef FLUSH_PEND
 #undef SUBTILE
     };
@@ -496,7 +512,7 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
 
 
 
-}  // namespace mqa_v35w
+}  // namespace mqa_v35wes
 
 #include <map>
 #include <mutex>
@@ -549,7 +565,7 @@ void dispatch_fp8_mqa_logits(const fp8* Q, const fp8* K, const float* scale, con
     const int row_blocks = CDIV_(M, 4 * num_warps);
     dim3 grid(row_blocks, split_n);
 #define L(NW, CL, RV) \
-    mqa_v35w::kernel<NW, 2, 4, CL, RV><<<grid, NW * WARP_SIZE, 0, stream>>>(Q, K, scale, w, ks, ke, out, M, N, split_n)
+    mqa_v35wes::kernel<NW, 2, 4, CL, RV><<<grid, NW * WARP_SIZE, 0, stream>>>(Q, K, scale, w, ks, ke, out, M, N, split_n)
 #define LC(NW) \
     if (clean) { if (rev) L(NW, true, true); else L(NW, true, false); } \
     else       { if (rev) L(NW, false, true); else L(NW, false, false); }
