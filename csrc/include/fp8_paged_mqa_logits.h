@@ -27,14 +27,15 @@
 
 // Writes into `out` when given (and returns it), otherwise allocates
 // [batch*next_n, max_model_len] f32. Only the causal window
-// p <= context_lens[b] - next_n + n is written; the -inf outside it is the
-// caller's, exactly as for deepgemm_fp8_paged_mqa_logits.
+// p <= context_lens[b] - next_n + n is written ([batch] lengths), or
+// p < context_lens[b][n] ([batch, next_n] lengths, one per query row); the -inf
+// outside it is the caller's, exactly as for deepgemm_fp8_paged_mqa_logits.
 torch::Tensor
 fp8_paged_mqa_logits(torch::Tensor q_fp8,        // [batch, next_n, 32, 128] fp8
                      torch::Tensor kv_cache_fp8, // [blocks, bsz, 1, index_dim];
                                                  // bsz=1 plain, bsz=64 preshuffled
                      torch::Tensor weights,      // [batch*next_n, 32] f32
-                     torch::Tensor context_lens, // [batch]             i32
+                     torch::Tensor context_lens, // [batch] or [batch, next_n] i32
                      torch::Tensor block_tables, // [batch, max_blocks] i32
                      int64_t max_model_len,
                      int64_t ChunkK,

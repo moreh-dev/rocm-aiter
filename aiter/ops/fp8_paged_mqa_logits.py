@@ -65,13 +65,15 @@ def fp8_paged_mqa_logits(
                  exactly as in production: block_size=1 takes the plain cache,
                  block_size=64 takes the `shuffle_weight(layout=(16, 16))`
                  preshuffled one.
-    weights      [batch*next_n, 32] f32   context_lens [batch] i32
+    weights      [batch*next_n, 32] f32
+    context_lens [batch] i32, or [batch, next_n] i32 with one length per query row
     block_tables [batch, max_blocks_per_seq] i32
 
     The zero-valued tunables (ChunkK, SplitKV, num_warps, RowsPerBlock) mean "use
     the host heuristic". Writes into `out` when given (and returns it), otherwise
-    allocates [batch*next_n, max_model_len] f32. Only the causal window
-    p <= context_lens[b] - next_n + n is written; the -inf outside it is the
+    allocates [batch*next_n, max_model_len] f32. Only the causal window is
+    written: p <= context_lens[b] - next_n + n for [batch] lengths, p <
+    context_lens[b, n] for [batch, next_n] ones. The -inf outside it is the
     caller's, exactly as for `deepgemm_fp8_paged_mqa_logits`.
     """
     ...

@@ -113,7 +113,10 @@ constexpr int OOB_VOFFSET    = 0x40800000;
 // R=6's register double buffer (KV_BLOCK_SIZE=1) fits 256 registers (2 waves/SIMD, what the
 // ~2 blocks/CU grid needs) only when the compiler is held to 2 waves/SIMD; uncapped it takes 272
 // and runs 1 wave/SIMD. Held to 2 it moves the accumulator out of AGPRs, with no spill.
-template <int NUM_WARPS, int CHUNK_K, int KV_BLOCK_SIZE, int ROWS_PER_BLOCK, bool K_NT>
+// ROW_LENS: context_lens holds one length per query row ([batch, next_n]) instead of one per
+// sequence ([batch], where row n sees context_lens[b] - next_n + n + 1 tokens).
+template <int NUM_WARPS, int CHUNK_K, int KV_BLOCK_SIZE, int ROWS_PER_BLOCK, bool K_NT,
+          bool ROW_LENS = false>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, ROWS_PER_BLOCK == 6 ? 2 : 1)
 void fp8_paged_mqa_logits_kernel(
     const fp8*   __restrict__ Q_ptr,
@@ -137,12 +140,42 @@ void fp8_paged_mqa_logits_kernel(
     const int row_start    = blockIdx.z * ROWS_PER_BLOCK;
     if (pid_batch >= batch_size || row_start >= next_n) return;
 
-    const int ctx_len      = context_lens[pid_batch];
+    // With ROW_LENS the block streams keys up to the longest of its rows (at least 0) and masks each
+    // row by its own length; rows past next_n reuse the last row's length (they are masked anyway).
+    // The lengths are all loaded before any of them is used, so the R scalar loads go out together
+    // behind one wait (using each one as it arrives compiles to R serialized load-wait pairs).
+    int row_len[ROWS_PER_BLOCK] = {};
+    int max_row_len = 0;
+    if constexpr (ROW_LENS) {
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_BLOCK; ++r)
+            row_len[r] = context_lens[pid_batch * next_n + min(row_start + r, next_n - 1)];
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_BLOCK; ++r)
+            max_row_len = max(max_row_len, row_len[r]);
+    }
+    const int ctx_len      = ROW_LENS ? max_row_len : context_lens[pid_batch];
     const int ctx_chunks   = CDIV(ctx_len, CHUNK_K);
     const int split_chunks = CDIV(ctx_chunks, SplitKV);
     const int split_start  = pid_split_kv * split_chunks * CHUNK_K;
     const int split_end    = min(ctx_len, split_start + split_chunks * CHUNK_K);
     if (split_start >= ctx_len) return;
+    // ROW_LENS: row r keeps position p iff p < row_lim[r] = min(row_len[r], max_model_len), which is
+    // the [batch] form's three tests (p < ctx_len, p <= the causal limit row_len - 1, p <
+    // max_model_len) since ctx_len, the longest row, is >= row_len[r]. Made once, each bound is one
+    // wave-uniform scalar held in an SGPR through the tile loop. (As the three tests, the compiler
+    // folds them into a loop-invariant v_min3_i32 per row: R VGPRs held through the loop, which at
+    // R = 6 pass 256 and spill.) row_last[r] = row_lim[r] - 1 is the PIPE stores' inclusive form,
+    // made here too: computed in the loop it is folded into two scalar ops, and the carried row's
+    // store then keeps a branch that reorders the step.
+    int row_lim[ROWS_PER_BLOCK] = {}, row_last[ROWS_PER_BLOCK] = {};
+    if constexpr (ROW_LENS) {
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            row_lim[r]  = __builtin_amdgcn_readfirstlane(min(row_len[r], max_model_len));
+            row_last[r] = __builtin_amdgcn_readfirstlane(min(row_len[r], max_model_len) - 1);
+        }
+    }
 
     const int l    = threadIdx.x % WARP_SIZE;
     // Wave-uniform by construction; readfirstlane lets the compiler keep tile indices in
@@ -241,9 +274,14 @@ void fp8_paged_mqa_logits_kernel(
 
             if (l < 32) {
                 const int abs_pos = token_base + jtok;
-                const int causal_limit = ctx_len - next_n + row_start + r;
-                if (abs_pos < ctx_len && abs_pos <= causal_limit && abs_pos < max_model_len)
-                    logits_ptr[(int64_t)(q_row0 + r) * max_model_len + abs_pos] = partial;
+                if constexpr (ROW_LENS) {
+                    if (abs_pos < row_lim[r])
+                        logits_ptr[(int64_t)(q_row0 + r) * max_model_len + abs_pos] = partial;
+                } else {
+                    const int causal_limit = ctx_len - next_n + row_start + r;
+                    if (abs_pos < ctx_len && abs_pos <= causal_limit && abs_pos < max_model_len)
+                        logits_ptr[(int64_t)(q_row0 + r) * max_model_len + abs_pos] = partial;
+                }
             }
         }
     };
@@ -278,9 +316,14 @@ void fp8_paged_mqa_logits_kernel(
     const int jcmp = (l < 32) ? jtok : (1 << 30);   // lanes 32-63 hold no logit
     const int joff = jtok * 4;
     auto store_row = [&](int r, int token_base, float val, bool ok) {
-        const int causal_limit = ctx_len - next_n + row_start + r;   // < ctx_len
         // the row's last position in the window, relative to the tile
-        const int lim = min(causal_limit, max_model_len - 1) - token_base;
+        int lim;
+        if constexpr (ROW_LENS) {
+            lim = row_last[r] - token_base;
+        } else {
+            const int causal_limit = ctx_len - next_n + row_start + r;   // < ctx_len
+            lim = min(causal_limit, max_model_len - 1) - token_base;
+        }
         const bool keep = ok && row_start + r < next_n && jcmp <= lim;
         __builtin_amdgcn_raw_buffer_store_b32(__builtin_bit_cast(unsigned, val), o_rsrc[r],
                                               keep ? joff : OOB_VOFFSET, token_base * 4, 0);
@@ -337,9 +380,12 @@ void fp8_paged_mqa_logits_kernel(
             // MFMAs, so the next tile is always in flight. Measured against that loop (graph
             // replay, cold KV, the 84 benchmark shapes at R >= 3): NBUF 2 1.061x (R=3 1.126x,
             // R=4 1.039x, R=6 1.038x, none slower), 3 1.052x, 4 1.027x; deeper rings gain ~2% on
-            // waves of 32+ tiles and lose up to 8% on short ones. At R <= 2 (the register ring
-            // above keeps two tiles in flight) no depth gained.
-            constexpr int NBUF = 2;
+            // waves of 32+ tiles and lose up to 8% on short ones. With the rows pipelined, against 2
+            // slots (graph replay, cold KV): R=6 3 slots 1.012x on its 20 shapes (R=3 / R=4 lose
+            // ~1.5% with 3; 4-5 slots spill at R=6). At 2 slots the R=6 ROW_LENS kernel spills (16
+            // VGPRs, reloaded every turn); at 3 it fits 256 registers like the [batch] one. At
+            // R <= 2 (the register ring above keeps two tiles in flight) no depth gained.
+            constexpr int NBUF = ROWS_PER_BLOCK == 6 ? 3 : 2;
             constexpr int PF   = NBUF - 1;
             static_assert(NBUF <= 4, "up to 4 ring slots");
             static_assert(KV_BLOCK_SIZE == 2 * TILE_N && NUM_WARPS % 2 == 0 && CHUNK_K % KV_BLOCK_SIZE == 0,
@@ -598,9 +644,10 @@ void fp8_paged_mqa_logits_kernel(
 // Host dispatch
 // ============================================================================
 // Non-temporal loads are only chosen at R <= 2 (see the heuristic), so only those
-// R are instantiated with them.
-template <int NW, int CK, int KB, int R>
-static void launch_fp8_paged_mqa_logits(
+// R are instantiated with them. Every kernel exists for [batch] lengths and, ROW_LENS,
+// for [batch, next_n] ones.
+template <int NW, int CK, int KB, int R, bool ROW_LENS>
+static void launch_kernel(
     bool k_nt, dim3 grid, hipStream_t stream,
     const fp8* d_q, const fp8* d_kv, const float* d_w,
     const int* d_ctx, const int* d_bt, float* d_out,
@@ -609,16 +656,34 @@ static void launch_fp8_paged_mqa_logits(
 ) {
     if constexpr (R <= 2) {
         if (k_nt) {
-            mqa_paged::fp8_paged_mqa_logits_kernel<NW, CK, KB, R, true>
+            mqa_paged::fp8_paged_mqa_logits_kernel<NW, CK, KB, R, true, ROW_LENS>
                 <<<grid, NW * WARP_SIZE, 0, stream>>>(
                     d_q, d_kv, d_w, d_ctx, d_bt, d_out,
                     batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
             return;
         }
     }
-    mqa_paged::fp8_paged_mqa_logits_kernel<NW, CK, KB, R, false>
+    mqa_paged::fp8_paged_mqa_logits_kernel<NW, CK, KB, R, false, ROW_LENS>
         <<<grid, NW * WARP_SIZE, 0, stream>>>(
             d_q, d_kv, d_w, d_ctx, d_bt, d_out,
+            batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
+}
+
+template <int NW, int CK, int KB, int R>
+static void launch_fp8_paged_mqa_logits(
+    bool k_nt, bool row_lens, dim3 grid, hipStream_t stream,
+    const fp8* d_q, const fp8* d_kv, const float* d_w,
+    const int* d_ctx, const int* d_bt, float* d_out,
+    int batch_size, int next_n,
+    int max_blocks_per_seq, int max_model_len, int index_dim, int SplitKV
+) {
+    if (row_lens)
+        launch_kernel<NW, CK, KB, R, true>(
+            k_nt, grid, stream, d_q, d_kv, d_w, d_ctx, d_bt, d_out,
+            batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
+    else
+        launch_kernel<NW, CK, KB, R, false>(
+            k_nt, grid, stream, d_q, d_kv, d_w, d_ctx, d_bt, d_out,
             batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
 }
 
@@ -628,7 +693,7 @@ static void dispatch_fp8_paged_mqa_logits(
     int batch_size, int next_n,
     int max_blocks_per_seq, int max_model_len, int index_dim,
     int ChunkK, int SplitKV, int num_warps, int kv_block_size,
-    int rows_per_block, bool k_nt, hipStream_t stream
+    int rows_per_block, bool k_nt, bool row_lens, hipStream_t stream
 ) {
     // grid = dim3(batch, SplitKV, num_groups). Each block owns ROWS_PER_BLOCK
     // (=R) consecutive next_n rows; num_groups = ceil(next_n / R).
@@ -637,7 +702,7 @@ static void dispatch_fp8_paged_mqa_logits(
 
     #define LAUNCH(NW, CK, KB, R)                                                       \
         launch_fp8_paged_mqa_logits<NW, CK, KB, R>(                                     \
-            k_nt, grid, stream, d_q, d_kv, d_w, d_ctx, d_bt, d_out,                     \
+            k_nt, row_lens, grid, stream, d_q, d_kv, d_w, d_ctx, d_bt, d_out,           \
             batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
 
     // R folds in as a compile-time constant so q_reg/w_reg stay in registers.
@@ -697,7 +762,7 @@ torch::Tensor fp8_paged_mqa_logits(
     torch::Tensor q_fp8,            // [batch, next_n, 32, 128]
     torch::Tensor kv_cache_fp8,     // [num_blocks, block_size, 1, index_dim]
     torch::Tensor weights,          // [batch*next_n, 32]
-    torch::Tensor context_lens,     // [batch]
+    torch::Tensor context_lens,     // [batch], or [batch, next_n] per query row
     torch::Tensor block_tables,     // [batch, max_blocks_per_seq]
     int64_t max_model_len,
     int64_t ChunkK,
@@ -720,6 +785,11 @@ torch::Tensor fp8_paged_mqa_logits(
                 "Only n_heads=32, head_dim=128 supported");
     TORCH_CHECK(kv_cache_fp8.is_contiguous(),
                 "kv_cache_fp8 must be contiguous for paged MQA logits");
+    const bool row_lens = context_lens.dim() == 2;
+    TORCH_CHECK(context_lens.scalar_type() == torch::kInt32 && context_lens.is_contiguous() &&
+                    context_lens.size(0) == batch_size &&
+                    (!row_lens || context_lens.size(1) == next_n) && context_lens.dim() <= 2,
+                "context_lens must be a contiguous i32 [batch] or [batch, next_n] tensor");
 
     // ---- autotune ChunkK, num_warps, R, SplitKV ----
     // From the gfx950 reliable (cache-busting) sweep, the best config tracks the
@@ -824,7 +894,7 @@ torch::Tensor fp8_paged_mqa_logits(
         batch_size, next_n, max_blocks_per_seq,
         static_cast<int>(max_model_len), index_dim,
         chunk_k_i, split_kv_i,
-        num_warps_i, kv_block_size, rows_per_block, k_nt, stream);
+        num_warps_i, kv_block_size, rows_per_block, k_nt, row_lens, stream);
 
     return out_logits;
 }
