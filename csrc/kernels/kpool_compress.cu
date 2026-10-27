@@ -515,7 +515,7 @@ __device__ __forceinline__ void insert_window(
     int page_shift,
     int64_t page_bytes,
     int flags,  // bit0: slot int64, bit1: preshuffle, bit2: round_scale, bit3: seed tail
-    const int32_t* __restrict__ seed_tslot,
+    const SlotT* __restrict__ seed_tslot,
     TailArgs ta,
     int grp,
     int sub) {
@@ -565,8 +565,8 @@ __device__ __forceinline__ void insert_window(
 #pragma unroll
     for (int s = 0; s < POOL; ++s) {
       const int64_t tok = win_first + s;
-      seed_ts[s] = tok < n_tokens ? seed_tslot[tok] : -1;
-      seed_ahead[s] = (tok + POOL < n_tokens) ? seed_tslot[tok + POOL] : -1;
+      seed_ts[s] = tok < n_tokens ? (int)seed_tslot[tok] : -1;
+      seed_ahead[s] = (tok + POOL < n_tokens) ? (int)seed_tslot[tok + POOL] : -1;
     }
   }
 
@@ -676,9 +676,9 @@ constexpr int DEC_BLOCK_WAVES = KPOOL_DEC_BLOCK_WAVES;  // requests per workgrou
 struct DecodeArgs {
   const uint16_t* key;       // [B, next_n, 128] bf16
   const uint16_t* score;     // [B, next_n, 128] bf16
-  const int32_t* tail_slot;  // [B, next_n]
-  const int32_t* slot_map;   // [B, next_n]
-  const int32_t* positions;  // [B, next_n]
+  const void* tail_slot;     // [B, next_n] int32 or int64 (IdxT)
+  const void* slot_map;      // [B, next_n] int32 or int64 (IdxT)
+  const void* positions;     // [B, next_n] int32 or int64 (IdxT)
   int key_sb, key_st, ss_sb, ss_st;  // strides in elements (checked to fit int32)
   int next_n;
   int num_requests;
@@ -690,9 +690,9 @@ struct DecodeArgs {
 struct __attribute__((aligned(16))) DecodeKArgs {
   const uint16_t* key;       // [B, next_n, 128] bf16
   const uint16_t* score;     // [B, next_n, 128] bf16
-  const int32_t* tail_slot;  // [B, next_n]
-  const int32_t* slot_map;   // [B, next_n]
-  const int32_t* positions;  // [B, next_n]
+  const void* tail_slot;     // [B, next_n] int32 or int64 (IdxT)
+  const void* slot_map;      // [B, next_n] int32 or int64 (IdxT)
+  const void* positions;     // [B, next_n] int32 or int64 (IdxT)
   const float* ape;          // [POOL, 128] fp32, contiguous
   uint16_t* tail;            // [num_blocks, 2, ring, 128] bf16
   uint8_t* cache;            // [num_blocks, page, 132] u8
@@ -804,7 +804,7 @@ __device__ __forceinline__ auto vpick(const V& v, int idx) {
 // Completions and stashes are issued in token order, so a later writer of the
 // same cache / ring slot wins as in the walk (same lane, same address:
 // program order).
-template <int POOL, int NMAX, bool VEC>
+template <int POOL, int NMAX, bool VEC, typename IdxT>
 __device__ __forceinline__ void decode_request(
     int req,  // wave-uniform
     const DecodeKArgs& d,
@@ -812,8 +812,11 @@ __device__ __forceinline__ void decode_request(
     uint32_t vmask = ~0u) {  // wave-uniform; 0 = padding wave (loads only, no stores)
   typedef typename Vec<NMAX>::i ivec;
   typedef typename Vec<NMAX>::u uvec;
-  gptr<const int32_t> m_ts = (gptr<const int32_t>)d.tail_slot, m_loc = (gptr<const int32_t>)d.slot_map,
-                      m_pos = (gptr<const int32_t>)d.positions;
+  // IdxT: int32 or int64 metadata (vLLM keeps its slot mappings in int64);
+  // the low dword is loaded either way, so the two instantiations differ
+  // only in the element stride.
+  gptr<const IdxT> m_ts = (gptr<const IdxT>)d.tail_slot, m_loc = (gptr<const IdxT>)d.slot_map,
+                   m_pos = (gptr<const IdxT>)d.positions;
   const gptr<const float> ape_g = (gptr<const float>)d.ape;
   const gptr<uint16_t> tail = (gptr<uint16_t>)d.tail;
   const gptr<uint8_t> cache_g = (gptr<uint8_t>)d.cache;
@@ -877,7 +880,7 @@ __device__ __forceinline__ void decode_request(
   // the wave starts; a lane-wise pointer select would cost ~20 VALU first)
   int32_t v_ts = 0, v_loc = 0, v_pos = 0;
   const int v_tok = min(sub, n - 1);
-  if constexpr (META_SMEM && NMAX > 1 && NMAX <= 8) {
+  if constexpr (META_SMEM && NMAX > 1 && NMAX <= 8 && sizeof(IdxT) == 4) {
     // next_n == NMAX (exact instantiations up to 8): the request's NMAX words
     // of each array are contiguous, one s_load_dwordxN per array (scalar
     // loads need dword alignment only)
@@ -888,15 +891,15 @@ __device__ __forceinline__ void decode_request(
 #pragma unroll
     for (int i = 0; i < NMAX; ++i) {
       const uint32_t j = (uint32_t)(base + (NMAX == 1 ? 0 : min(i, n - 1)));
-      loc[i] = m_loc[j];
-      pos[i] = m_pos[j];
-      ts[i] = m_ts[j];
+      loc[i] = (int32_t)m_loc[j];
+      pos[i] = (int32_t)m_pos[j];
+      ts[i] = (int32_t)m_ts[j];
     }
   } else {
     const uint32_t jl = (uint32_t)(base + v_tok);
-    v_ts = m_ts[jl];
-    v_loc = m_loc[jl];
-    v_pos = m_pos[jl];
+    v_ts = (int32_t)m_ts[jl];
+    v_loc = (int32_t)m_loc[jl];
+    v_pos = (int32_t)m_pos[jl];
   }
   // every token's metadata as scalars (the one-token path)
   auto read_meta = [&]() {
@@ -1246,11 +1249,11 @@ __device__ __forceinline__ void decode_request(
 }
 
 
-template <int POOL, int NMAX, bool VEC>
+template <int POOL, int NMAX, bool VEC, typename IdxT>
 // waves_per_eu(8, 8): keep occupancy 8 (<= 64 VGPRs) for every NMAX
 __global__ void __launch_bounds__(64 * DEC_BLOCK_WAVES) __attribute__((amdgpu_waves_per_eu(8, 8))) kpool_decode_kernel(
-    const uint16_t* key, const uint16_t* score, const int32_t* tail_slot, const int32_t* slot_map,
-    const int32_t* positions, int key_sb, int ss_sb, int next_n, int num_requests, DecodeKRest r) {
+    const uint16_t* key, const uint16_t* score, const void* tail_slot, const void* slot_map,
+    const void* positions, int key_sb, int ss_sb, int next_n, int num_requests, DecodeKRest r) {
   DecodeKArgs d;
   d.key = key; d.score = score; d.tail_slot = tail_slot; d.slot_map = slot_map; d.positions = positions;
   d.key_sb = key_sb; d.ss_sb = ss_sb; d.next_n = next_n; d.num_requests = num_requests;
@@ -1267,7 +1270,7 @@ __global__ void __launch_bounds__(64 * DEC_BLOCK_WAVES) __attribute__((amdgpu_wa
   const bool valid = req_raw < d.num_requests;
   const int req = valid ? req_raw : d.num_requests - 1;
   const uint32_t vmask = 0u - s_bit31((uint32_t)(req_raw - d.num_requests));  // ~0 iff valid
-  decode_request<POOL, NMAX, VEC>(req, d, lane, vmask);
+  decode_request<POOL, NMAX, VEC, IdxT>(req, d, lane, vmask);
 }
 
 // ===========================================================================
@@ -1286,7 +1289,7 @@ __global__ void __launch_bounds__(64) kpool_mixed_kernel(
     int64_t n_windows,
     int64_t k_stride,
     int64_t gate_stride,
-    const int32_t* __restrict__ seed_tslot,
+    const SlotT* __restrict__ seed_tslot,
     const float* __restrict__ ape,
     int64_t ape_stride,
     TailArgs ta,
@@ -1299,7 +1302,7 @@ __global__ void __launch_bounds__(64) kpool_mixed_kernel(
   const int n_dec = da.num_requests;
   if ((int)blockIdx.x < n_dec) {
     const DecodeKArgs d = make_kargs(da, ape, ta, cache, page_size, page_shift, (uint32_t)page_bytes, flags & 6);
-    decode_request<POOL, NMAX, VEC>(blockIdx.x, d, lane);
+    decode_request<POOL, NMAX, VEC, SlotT>(blockIdx.x, d, lane);
   } else {
     constexpr int GROUPS_PER_WAVE = 64 / LANES;
     const int grp = GROUPS_PER_WAVE == 1 ? 0 : lane / LANES;
@@ -1367,7 +1370,7 @@ int launch_insert(int lanes, bool vec, bool i64, const void* k, const void* gate
 }
 
 template <int POOL, int NMAX>
-int launch_decode_n(bool vec, const DecodeArgs& da, const void* ape, int64_t ape_stride, TailArgs ta, void* cache,
+int launch_decode_n(bool vec, bool i64, const DecodeArgs& da, const void* ape, int64_t ape_stride, TailArgs ta, void* cache,
                     int page_size, int64_t page_bytes, int flags, hipStream_t stream) {
   const int grid = (da.num_requests + DEC_BLOCK_WAVES - 1) / DEC_BLOCK_WAVES;
   if (grid == 0) return 0;
@@ -1378,21 +1381,24 @@ int launch_decode_n(bool vec, const DecodeArgs& da, const void* ape, int64_t ape
   r.ape = d.ape; r.tail = d.tail; r.cache = d.cache; r.key_st = d.key_st; r.ss_st = d.ss_st;
   r.block_elems = d.block_elems; r.head_elems = d.head_elems; r.ring_mask = d.ring_mask; r.ring_shift = d.ring_shift;
   r.page_size = d.page_size; r.page_shift = d.page_shift; r.page_bytes = d.page_bytes; r.flags = d.flags;
-  if (vec)
-    hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, true>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream,
-                       d.key, d.score, d.tail_slot, d.slot_map, d.positions, d.key_sb, d.ss_sb, d.next_n, d.num_requests, r);
-  else
-    hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, false>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream,
-                       d.key, d.score, d.tail_slot, d.slot_map, d.positions, d.key_sb, d.ss_sb, d.next_n, d.num_requests, r);
+#define KPOOL_D(V, I)                                                                                         \
+  hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, V, I>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream, \
+                     d.key, d.score, d.tail_slot, d.slot_map, d.positions, d.key_sb, d.ss_sb, d.next_n,          \
+                     d.num_requests, r);
+  if (vec && i64) { KPOOL_D(true, int64_t) }
+  else if (vec) { KPOOL_D(true, int32_t) }
+  else if (i64) { KPOOL_D(false, int64_t) }
+  else { KPOOL_D(false, int32_t) }
+#undef KPOOL_D
   return (int)hipGetLastError();
 }
 
 template <int POOL>
-int launch_decode(bool vec, const DecodeArgs& da, const void* ape, int64_t ape_stride, TailArgs ta, void* cache,
+int launch_decode(bool vec, bool i64, const DecodeArgs& da, const void* ape, int64_t ape_stride, TailArgs ta, void* cache,
                   int page_size, int64_t page_bytes, int flags, hipStream_t stream) {
   const int n = da.next_n;
 #define KPOOL_N(N)                                                                                            \
-  if (n <= N) return launch_decode_n<POOL, N>(vec, da, ape, ape_stride, ta, cache, page_size, page_bytes, flags, stream);
+  if (n <= N) return launch_decode_n<POOL, N>(vec, i64, da, ape, ape_stride, ta, cache, page_size, page_bytes, flags, stream);
 #ifdef KPOOL_ISA_QUICK
   KPOOL_N(1) KPOOL_N(2) KPOOL_N(4) KPOOL_N(8)
 #else
@@ -1404,7 +1410,7 @@ int launch_decode(bool vec, const DecodeArgs& da, const void* ape, int64_t ape_s
 
 template <int POOL, int NMAX, int LANES, bool VEC, typename SlotT>
 int launch_mixed_t(const DecodeArgs& da, const void* k, const void* gate, const void* slot, int64_t n_tokens,
-                   int64_t k_stride, int64_t gate_stride, const int32_t* seed_tslot, const void* ape,
+                   int64_t k_stride, int64_t gate_stride, const void* seed_tslot, const void* ape,
                    int64_t ape_stride, TailArgs ta, void* cache, int page_size, int64_t page_bytes, int flags,
                    hipStream_t stream) {
   constexpr int GROUPS_PER_WAVE = 64 / LANES;
@@ -1414,14 +1420,14 @@ int launch_mixed_t(const DecodeArgs& da, const void* k, const void* gate, const 
   if (grid == 0) return 0;
   hipLaunchKernelGGL((kpool_mixed_kernel<POOL, NMAX, LANES, VEC, SlotT>), dim3((unsigned)grid), dim3(64), 0, stream,
                      da, (const uint16_t*)k, (const uint16_t*)gate, slot, n_tokens, n_windows, k_stride,
-                     gate_stride, seed_tslot, (const float*)ape, ape_stride, ta, (uint8_t*)cache, page_size,
+                     gate_stride, (const SlotT*)seed_tslot, (const float*)ape, ape_stride, ta, (uint8_t*)cache, page_size,
                      page_shift_of(page_size), page_bytes, flags);
   return (int)hipGetLastError();
 }
 
 template <int POOL, int NMAX, int LANES>
 int launch_mixed_l(bool vec, bool i64, const DecodeArgs& da, const void* k, const void* gate, const void* slot,
-                   int64_t n_tokens, int64_t k_stride, int64_t gate_stride, const int32_t* seed_tslot,
+                   int64_t n_tokens, int64_t k_stride, int64_t gate_stride, const void* seed_tslot,
                    const void* ape, int64_t ape_stride, TailArgs ta, void* cache, int page_size, int64_t page_bytes,
                    int flags, hipStream_t stream) {
 #define KPOOL_M(V, S)                                                                                           \
@@ -1437,7 +1443,7 @@ int launch_mixed_l(bool vec, bool i64, const DecodeArgs& da, const void* k, cons
 template <int POOL, int NMAX>
 int launch_mixed_n(int lanes, bool vec, bool i64, const DecodeArgs& da, const void* k, const void* gate,
                    const void* slot, int64_t n_tokens, int64_t k_stride, int64_t gate_stride,
-                   const int32_t* seed_tslot, const void* ape, int64_t ape_stride, TailArgs ta, void* cache,
+                   const void* seed_tslot, const void* ape, int64_t ape_stride, TailArgs ta, void* cache,
                    int page_size, int64_t page_bytes, int flags, hipStream_t stream) {
 #define KPOOL_L(L)                                                                                              \
   if (lanes == L)                                                                                               \
@@ -1455,7 +1461,7 @@ int launch_mixed_n(int lanes, bool vec, bool i64, const DecodeArgs& da, const vo
 template <int POOL>
 int launch_mixed(int lanes, bool vec, bool i64, const DecodeArgs& da, const void* k, const void* gate,
                  const void* slot, int64_t n_tokens, int64_t k_stride, int64_t gate_stride,
-                 const int32_t* seed_tslot, const void* ape, int64_t ape_stride, TailArgs ta, void* cache,
+                 const void* seed_tslot, const void* ape, int64_t ape_stride, TailArgs ta, void* cache,
                  int page_size, int64_t page_bytes, int flags, hipStream_t stream) {
   const int n = da.next_n;
 #define KPOOL_N(N)                                                                                            \
@@ -1566,17 +1572,19 @@ bool slot_is_i64(const aiter_tensor_t& slot_mapping)
     return slot_mapping.dtype() == AITER_DTYPE_i64;
 }
 
-void check_i32_map(const aiter_tensor_t& t, int64_t B, int64_t next_n, const char* name)
+void check_map(const aiter_tensor_t& t, int64_t B, int64_t next_n, bool i64, const char* name)
 {
-    AITER_CHECK(t.dtype() == AITER_DTYPE_i32 && t.dim() == 2 && t.size(0) == B && t.size(1) == next_n &&
-                    t.is_contiguous(),
-                name, " must be a contiguous int32 [num_requests, next_n] tensor");
+    AITER_CHECK(t.dtype() == (i64 ? AITER_DTYPE_i64 : AITER_DTYPE_i32) && t.dim() == 2 && t.size(0) == B &&
+                    t.size(1) == next_n && t.is_contiguous(),
+                name, " must be a contiguous ", i64 ? "int64" : "int32",
+                " [num_requests, next_n] tensor (same dtype as tail_slot_mapping)");
 }
 
 struct DecodeChecked
 {
     DecodeArgs da;
     bool vec;
+    bool i64;  // metadata dtype (tail_slot_mapping, slot_mapping, positions all int32 or all int64)
 };
 
 DecodeChecked check_decode(const aiter_tensor_t& tail_kv_cache,
@@ -1596,9 +1604,12 @@ DecodeChecked check_decode(const aiter_tensor_t& tail_kv_cache,
                 "slot_score must be bf16 [num_requests, next_n, 128] with unit inner stride");
     const int64_t B = key.size(0), next_n = key.size(1);
     AITER_CHECK(next_n >= 1 && next_n <= 16, "next_n must be in [1, 16], got ", next_n);
-    check_i32_map(tail_slot_mapping, B, next_n, "tail_slot_mapping");
-    check_i32_map(slot_mapping, B, next_n, "slot_mapping");
-    check_i32_map(positions, B, next_n, "positions");
+    AITER_CHECK(tail_slot_mapping.dtype() == AITER_DTYPE_i32 || tail_slot_mapping.dtype() == AITER_DTYPE_i64,
+                "tail_slot_mapping must be int32 or int64, got ", AiterDtype_to_str(tail_slot_mapping.dtype()));
+    const bool i64 = tail_slot_mapping.dtype() == AITER_DTYPE_i64;
+    check_map(tail_slot_mapping, B, next_n, i64, "tail_slot_mapping");
+    check_map(slot_mapping, B, next_n, i64, "slot_mapping");
+    check_map(positions, B, next_n, i64, "positions");
     AITER_CHECK(tail_kv_cache.dtype() == AITER_DTYPE_bf16 && tail_kv_cache.dim() == 4 &&
                     tail_kv_cache.size(1) == 2 && tail_kv_cache.size(3) == KPOOL_HEAD_DIM &&
                     tail_kv_cache.stride(3) == 1 && tail_kv_cache.stride(2) == KPOOL_HEAD_DIM,
@@ -1612,9 +1623,9 @@ DecodeChecked check_decode(const aiter_tensor_t& tail_kv_cache,
     DecodeChecked r;
     r.da = DecodeArgs{static_cast<const uint16_t*>(key.data_ptr()),
                       static_cast<const uint16_t*>(slot_score.data_ptr()),
-                      static_cast<const int32_t*>(tail_slot_mapping.data_ptr()),
-                      static_cast<const int32_t*>(slot_mapping.data_ptr()),
-                      static_cast<const int32_t*>(positions.data_ptr()),
+                      tail_slot_mapping.data_ptr(),
+                      slot_mapping.data_ptr(),
+                      positions.data_ptr(),
                       static_cast<int>(key.stride(0)),
                       static_cast<int>(key.stride(1)),
                       static_cast<int>(slot_score.stride(0)),
@@ -1624,6 +1635,7 @@ DecodeChecked check_decode(const aiter_tensor_t& tail_kv_cache,
     r.vec = aligned(key.data_ptr(), key.stride(1), 2, 4) && aligned(slot_score.data_ptr(), slot_score.stride(1), 2, 4) &&
             aligned(tail_kv_cache.data_ptr(), tail_kv_cache.stride(0), 2, 4) &&
             aligned(tail_kv_cache.data_ptr(), tail_kv_cache.stride(1), 2, 4);
+    r.i64 = i64;
     return r;
 }
 
@@ -1698,7 +1710,7 @@ void kpool_decode_update(aiter_tensor_t& kv_cache,
     HipDeviceGuard device_guard(kv_cache.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     int rc = -3;
-    KPOOL_POOL_SWITCH(rc = launch_decode<P>(d.vec, d.da, ape.data_ptr(), ape.stride(0), ta, kv_cache.data_ptr(),
+    KPOOL_POOL_SWITCH(rc = launch_decode<P>(d.vec, d.i64, d.da, ape.data_ptr(), ape.stride(0), ta, kv_cache.data_ptr(),
                                             page_size, kv_cache.stride(0), flags, stream); break;)
     check_rc(rc, "kpool_decode_update");
 }
@@ -1762,12 +1774,14 @@ void kpool_mixed_write(aiter_tensor_t& kv_cache,
 
     DecodeArgs da{nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0};
     bool dec_vec = true;
+    bool dec_i64 = false;
     if(has_decode)
     {
         DecodeChecked d = check_decode(*tail_kv_cache, *decode_tail_slot_mapping, *decode_key, *decode_gate,
                                        *decode_slot_mapping, *decode_positions, pool_size);
         da      = d.da;
         dec_vec = d.vec;
+        dec_i64 = d.i64;
     }
 
     AITER_CHECK(prefill_gate && prefill_slot_mapping, "prefill_gate and prefill_slot_mapping are required with prefill_k");
@@ -1776,13 +1790,16 @@ void kpool_mixed_write(aiter_tensor_t& kv_cache,
     AITER_CHECK(prefill_gate->size(0) == n_tokens, "prefill_k and prefill_gate must have the same number of rows");
     const bool i64 = slot_is_i64(*prefill_slot_mapping);
     AITER_CHECK(prefill_slot_mapping->size(0) == n_tokens, "prefill_slot_mapping must have one entry per token");
-    const int32_t* seed_tslot = nullptr;
+    // one index type per launch: the decode metadata and the seed slots must
+    // match the prefill slot_mapping (int32 or int64)
+    AITER_CHECK(!has_decode || dec_i64 == i64,
+                "decode tail_slot_mapping / slot_mapping / positions must have the dtype of prefill_slot_mapping");
+    const void* seed_tslot = nullptr;
     if(seed)
     {
-        AITER_CHECK(prefill_tail_slot_mapping->dtype() == AITER_DTYPE_i32 && prefill_tail_slot_mapping->dim() == 1 &&
-                        prefill_tail_slot_mapping->size(0) == n_tokens && prefill_tail_slot_mapping->stride(0) == 1,
-                    "prefill_tail_slot_mapping must be a contiguous int32 [n_tokens] tensor");
-        seed_tslot = static_cast<const int32_t*>(prefill_tail_slot_mapping->data_ptr());
+        AITER_CHECK(slot_is_i64(*prefill_tail_slot_mapping) == i64 && prefill_tail_slot_mapping->size(0) == n_tokens,
+                    "prefill_tail_slot_mapping must be a contiguous [n_tokens] tensor with the dtype of prefill_slot_mapping");
+        seed_tslot = prefill_tail_slot_mapping->data_ptr();
     }
     const int lanes = lanes_per_pool > 0 ? lanes_per_pool : kpool_pick_lanes(n_tokens, pool_size);
     const bool vec  = aligned(prefill_k->data_ptr(), prefill_k->stride(0), 2, 16) &&

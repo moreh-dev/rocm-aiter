@@ -220,13 +220,15 @@ def make_prefill(lens, pool, page, slot_dtype=torch.int64, seed=0, ring=None, nb
     gate = (torch.randn(n, HEAD_DIM, generator=g, device="cuda") * 3).bfloat16()
     ape = torch.randn(pool, HEAD_DIM, generator=g, device="cuda")
     slot = torch.tensor(slots, dtype=slot_dtype)
-    tslot = torch.tensor(tslots, dtype=torch.int32)
+    tslot = torch.tensor(tslots, dtype=slot_dtype)  # the seed slots share the slot_mapping dtype
     kv = torch.zeros(num_blocks, page, HEAD_DIM + 4, dtype=torch.uint8)
     return k, gate, ape, slot, tslot, kv
 
 
-def make_decode(B, next_n, pool, page=64, seed=0, ring=None, nblocks=None):
-    """B requests x next_n consecutive tokens from random context lengths."""
+def make_decode(B, next_n, pool, page=64, seed=0, ring=None, nblocks=None, idx_dtype=torch.int32):
+    """B requests x next_n consecutive tokens from random context lengths.
+    ``idx_dtype`` (int32 / int64) is the dtype of the three metadata tensors
+    (vLLM keeps its slot mappings and positions in int64)."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     ring = ring or pool
     nblocks = nblocks or B + 2
@@ -244,8 +246,8 @@ def make_decode(B, next_n, pool, page=64, seed=0, ring=None, nblocks=None):
     score = torch.randn(B, next_n, HEAD_DIM, generator=g, device="cuda").bfloat16()
     ape = torch.randn(pool, HEAD_DIM, generator=g, device="cuda")
     kv = torch.zeros(n_pages, page, HEAD_DIM + 4, dtype=torch.uint8)
-    return dict(kv=kv, tail=tail, tail_slot=tail_slot, key=key, score=score, ape=ape,
-                slot_map=slot_map, pos=pos, pool=pool)
+    return dict(kv=kv, tail=tail, tail_slot=tail_slot.to(idx_dtype), key=key, score=score, ape=ape,
+                slot_map=slot_map.to(idx_dtype), pos=pos.to(idx_dtype), pool=pool)
 
 
 def compare_cache(kv_ref, kv_got, msg):
@@ -285,8 +287,8 @@ def test_insert(lens, pool, page, slot_dtype=torch.int64, lanes=0, round_scale=T
 
 
 @benchmark()
-def test_decode(B, next_n, pool, page=64, round_scale=True, ring=None):
-    d = make_decode(B, next_n, pool, page, seed=B * 100 + next_n, ring=ring)
+def test_decode(B, next_n, pool, page=64, round_scale=True, ring=None, idx_dtype=torch.int32):
+    d = make_decode(B, next_n, pool, page, seed=B * 100 + next_n, ring=ring, idx_dtype=idx_dtype)
     kv_ref, tail_ref = d["kv"].clone(), d["tail"].clone()
     ref_decode(kv_ref, tail_ref, d["tail_slot"], d["key"], d["score"], d["ape"],
                d["slot_map"], d["pos"], pool, round_scale)
@@ -303,8 +305,8 @@ def test_decode(B, next_n, pool, page=64, round_scale=True, ring=None):
         aiter.kpool_decode_update, d["kv"].clone(), d["tail"].clone(), d["tail_slot"], d["key"],
         d["score"], d["ape"], d["slot_map"], d["pos"], pool, round_scale, num_iters=20, num_warmup=2,
     )
-    ret = {"ring": d["tail"].shape[2], "err": err, "scale err": err_s, "diff bytes": diff_bytes,
-           "tail exact": tail_ok, "us": us}
+    ret = {"ring": d["tail"].shape[2], "idx": str(idx_dtype).replace("torch.", ""), "err": err,
+           "scale err": err_s, "diff bytes": diff_bytes, "tail exact": tail_ok, "us": us}
     assert tail_ok, "tail ring mismatch"
     if _VLLM is not None:
         if d["tail"].shape[2] == pool:
@@ -321,10 +323,11 @@ def test_decode(B, next_n, pool, page=64, round_scale=True, ring=None):
 
 
 @benchmark()
-def test_mixed(lens, B, next_n, pool, page=64, round_scale=True):
+def test_mixed(lens, B, next_n, pool, page=64, round_scale=True, idx_dtype=torch.int64):
     ring = pool
-    d = make_decode(B, next_n, pool, page, seed=7, ring=ring, nblocks=B + len(lens) + 2)
-    k, gate, ape, slot, tslot, kv_p = make_prefill(lens, pool, page, torch.int64, seed=11,
+    # one index dtype per launch: prefill slot_mapping, seed slots and decode metadata
+    d = make_decode(B, next_n, pool, page, seed=7, ring=ring, nblocks=B + len(lens) + 2, idx_dtype=idx_dtype)
+    k, gate, ape, slot, tslot, kv_p = make_prefill(lens, pool, page, idx_dtype, seed=11,
                                                     ring=ring, nblock_offset=B)
     # prefill cache slots live in their own pages, after the decode pages
     slot = torch.where(slot >= 0, slot + d["kv"].shape[0] * page, slot)
@@ -392,12 +395,17 @@ if args.only in (None, "decode"):
     # regular decode path; ring == pool above exercises the generic one
     for B, next_n, ring in ((8, 2, 8), (6, 3, 8), (5, 4, 8), (4, 5, 8), (4, 6, 16), (4, 7, 16), (5, 8, 16), (3, 16, 32)):
         rows.append(test_decode(B, next_n, 4, ring=ring))
+    # int64 metadata (vLLM): same kernels with an 8 B element stride
+    for B, next_n, ring in ((4, 1, 4), (5, 4, 8), (3, 2, 4), (5, 8, 16)):
+        rows.append(test_decode(B, next_n, 4, ring=ring, idx_dtype=torch.int64))
     if not args.quick:
         rows.append(test_decode(64, 4, 4))
         rows.append(test_decode(32, 16, 4))
+        rows.append(test_decode(64, 1, 4, idx_dtype=torch.int64))
     tables["decode"] = pd.DataFrame(rows)
 if args.only in (None, "mixed"):
-    rows = [test_mixed([64, 9], 1, 1, 4), test_mixed([4096, 17, 300], 8, 4, 4)]
+    rows = [test_mixed([64, 9], 1, 1, 4), test_mixed([4096, 17, 300], 8, 4, 4),
+            test_mixed([64, 9], 1, 1, 4, idx_dtype=torch.int32), test_mixed([300, 17], 8, 4, 4, idx_dtype=torch.int32)]
     if not args.quick:
         rows.append(test_mixed([2048] * 4, 32, 2, 4))
     tables["mixed"] = pd.DataFrame(rows)
