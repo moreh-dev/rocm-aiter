@@ -58,12 +58,12 @@ def kpool_compress_insert(
 def kpool_decode_update(
     kv_cache: Tensor,  # [num_blocks, page_size, 132] uint8
     tail_kv_cache: Tensor,  # [num_blocks, 2, ring, 128] bf16, ring % pool_size == 0
-    tail_slot_mapping: Tensor,  # [num_requests, next_n] int32
+    tail_slot_mapping: Tensor,  # [num_requests, next_n] int32 / int64 (all three metadata tensors alike)
     key: Tensor,  # [num_requests, next_n, 128] bf16
     slot_score: Tensor,  # [num_requests, next_n, 128] bf16
     ape: Tensor,  # [pool_size, 128] fp32
-    slot_mapping: Tensor,  # [num_requests, next_n] int32, >= 0 on closing tokens
-    positions: Tensor,  # [num_requests, next_n] int32
+    slot_mapping: Tensor,  # [num_requests, next_n] int32 / int64, >= 0 on closing tokens
+    positions: Tensor,  # [num_requests, next_n] int32 / int64
     pool_size: int,
     round_scale: bool = True,
 ) -> None: ...
@@ -79,8 +79,9 @@ def kpool_mixed_write(
     prefill_k: Tensor | None = None,
     prefill_gate: Tensor | None = None,
     prefill_slot_mapping: Tensor | None = None,
-    prefill_tail_slot_mapping: Tensor | None = None,  # [n_tokens] int32: seed the tail ring
+    prefill_tail_slot_mapping: Tensor | None = None,  # [n_tokens], dtype of prefill_slot_mapping: seed the tail ring
     tail_kv_cache: Tensor | None = None,
+    # decode metadata: int32 or int64, the dtype of prefill_slot_mapping when both sides are given
     decode_tail_slot_mapping: Tensor | None = None,
     decode_key: Tensor | None = None,
     decode_gate: Tensor | None = None,

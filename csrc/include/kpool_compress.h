@@ -33,7 +33,7 @@ void kpool_compress_insert(aiter_tensor_t& kv_cache,
 // tail_kv_cache [num_blocks, 2, ring, 128] bf16 (ring a multiple of pool_size);
 // a token that closes a pool compresses it into kv_cache. key, slot_score
 // [num_requests, next_n, 128] bf16; tail_slot_mapping, slot_mapping, positions
-// [num_requests, next_n] int32; next_n <= 16.
+// [num_requests, next_n] all int32 or all int64; next_n <= 16.
 void kpool_decode_update(aiter_tensor_t& kv_cache,
                          aiter_tensor_t& tail_kv_cache,
                          const aiter_tensor_t& tail_slot_mapping,
@@ -46,8 +46,10 @@ void kpool_decode_update(aiter_tensor_t& kv_cache,
                          bool round_scale = true);
 
 // Mixed step in one launch: the prefill insert on prefill_*, the tail seeding
-// (kpool_seed_tail_cache) when prefill_tail_slot_mapping [n_tokens] int32 is
-// given, and the decode update on decode_*. Either side may be absent.
+// (kpool_seed_tail_cache) when prefill_tail_slot_mapping [n_tokens] is given,
+// and the decode update on decode_*. Either side may be absent. One index
+// dtype per launch: the seed slots and the decode metadata must have the
+// dtype of prefill_slot_mapping (int32 or int64).
 void kpool_mixed_write(aiter_tensor_t& kv_cache,
                        const aiter_tensor_t& ape,
                        int pool_size,
