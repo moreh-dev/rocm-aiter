@@ -12,6 +12,9 @@
 //   score_s = f32(gate[t-POOL+1+s][d]) + ape[s][d]
 //   prob_s  = exp(score_s - max_s score_s)          (exp = exp2(x * log2e))
 //   x       = (sum_s k_s * prob_s) / (sum_s prob_s)   -> bf16 -> f32
+//             (k_s * prob_s rounded, then added: Triton >= 3.8 does not
+//             contract this into an FMA; -DKPOOL_ACC_FMA restores the FMA
+//             that Triton 3.7 emitted)
 //   x       = Hadamard128(x) * (1/sqrt(128))          -> bf16 -> f32
 //   absmax  = max(max_d |x_d|, 1e-4)
 //   scale   = round_scale ? exp2(ceil(log2(absmax/448))) : absmax/448
@@ -284,7 +287,11 @@ __device__ __forceinline__ void compress_pool(
     for (int d = 0; d < DPL; ++d) mx[d] = fmaxf(mx[d], bf16at(gw[s], d) + ape[s][d]);
   }
 
-  // --- pass 2: softmax-weighted sum of k (denom += p; acc = fma(k, p, acc)) ---
+  // --- pass 2: softmax-weighted sum of k (denom += p; acc += k * p) ---
+  // Triton >= 3.8 (vLLM image) keeps `acc += k * prob` as a rounded multiply
+  // followed by an add; Triton 3.7 contracted it into an FMA. The two differ
+  // in ~11 % of the fp32 sums, which flips the bf16 rounding of x in ~1 per
+  // 10^5 elements. Default: match Triton >= 3.8. -DKPOOL_ACC_FMA: Triton 3.7.
   float acc[DPL], den[DPL];
 #pragma unroll
   for (int d = 0; d < DPL; ++d) { acc[d] = 0.0f; den[d] = 0.0f; }
@@ -295,7 +302,14 @@ __device__ __forceinline__ void compress_pool(
       float score = bf16at(gw[s], d) + ape[s][d];
       float p = fast_exp2((score - mx[d]) * LOG2E);
       den[d] += p;
+#ifdef KPOOL_ACC_FMA
       acc[d] = __builtin_fmaf(bf16at(kw[s], d), p, acc[d]);
+#else
+      {
+#pragma clang fp contract(off)  // hipcc contracts even __fmul_rn/__fadd_rn
+        acc[d] = acc[d] + bf16at(kw[s], d) * p;
+      }
+#endif
     }
   }
 
