@@ -468,8 +468,8 @@ __device__ __forceinline__ int xcd_remap(int b, int nb) {
 
 struct TailArgs {
   uint16_t* tail;        // [num_blocks, 2, ring, 128] bf16 (strides below, in elements)
-  int block_elems;       // stride(0); the whole tail has < 2^31 elements (checked), so
-  int head_elems;        // stride(1)  every offset into it fits 32 bits
+  int block_elems;       // stride(0) < 2^31 (checked); vLLM pads the tail page to the KV
+  int head_elems;        // stride(1)  page, so block * stride(0) is formed in 64 bits
   int ring_mask;         // ring - 1; ring = shape[2] is a power of two (checked by the entry points)
   int ring_shift;        // log2(ring)
 };
@@ -636,7 +636,7 @@ __device__ __forceinline__ void insert_window(
         load_row<DPL, VEC>(k + tok * k_stride + d0, rk);
         load_row<DPL, VEC>(gate + tok * gate_stride + d0, rs);
       }
-      const uint32_t dst = (uint32_t)blk * (uint32_t)ta.block_elems + (uint32_t)ring_mod(ts, ta) * HEAD_DIM + d0;
+      const uint64_t dst = (uint64_t)(uint32_t)blk * (uint32_t)ta.block_elems + (uint32_t)(ring_mod(ts, ta) * HEAD_DIM + d0);
       uint32_t* pk = reinterpret_cast<uint32_t*>(ta.tail + dst);
       uint32_t* ps = reinterpret_cast<uint32_t*>(ta.tail + (uint32_t)ta.head_elems + dst);
 #pragma unroll
@@ -712,7 +712,7 @@ struct __attribute__((aligned(16))) DecodeKArgs {
   uint8_t* cache;            // [num_blocks, page, 132] u8
   int key_sb, key_st, ss_sb, ss_st;  // strides in elements (checked to fit int32)
   int next_n, num_requests;
-  int block_elems, head_elems;       // tail strides (elements; the tail has < 2^31 elements)
+  int block_elems, head_elems;       // tail strides (elements, each < 2^31; block offsets are 64-bit)
   int ring_mask, ring_shift;         // ring - 1, log2(ring)
   int page_size, page_shift;         // page_shift = log2(page_size) or -1
   uint32_t page_bytes;               // page_size * 132
@@ -941,7 +941,7 @@ __device__ __forceinline__ void decode_request(
   };
   // K row (block b, ring slot ph) of the tail; the gate row is ta.head_elems further
   auto tail_row = [&](int b, int ph) -> gptr<uint16_t> {
-    return tail + (uint32_t)(b * ta.block_elems + ph * HEAD_DIM);
+    return tail + (uint64_t)(uint32_t)b * (uint32_t)ta.block_elems + ph * HEAD_DIM;
   };
   auto write_pool = [&](const uint32_t (&gw)[POOL][1], const uint32_t (&kw)[POOL][1], int loc_i, auto mid) {
     int tok;
@@ -1003,7 +1003,7 @@ __device__ __forceinline__ void decode_request(
       // head_elems further) and, when live, token row kbr + j. The ring
       // rows read (j < r) never wrap; the token rows stash into
       // (pstart + j) mod ring: rows j >= wrap use the base one ring lower.
-      const gptr<uint16_t> tkp = tail + (uint32_t)(blk0 * ta.block_elems + pstart * HEAD_DIM);
+      const gptr<uint16_t> tkp = tail + (uint64_t)(uint32_t)blk0 * (uint32_t)ta.block_elems + pstart * HEAD_DIM;
       const gptr<uint16_t> tgp = tkp + (uint32_t)ta.head_elems;
       const int ring = ta.ring_mask + 1;
       const int wrap = ring - pstart;
@@ -1657,7 +1657,13 @@ TailArgs tail_args(const aiter_tensor_t& tail_kv_cache)
 {
     const int ring = static_cast<int>(tail_kv_cache.size(2));
     AITER_CHECK(ring > 0 && (ring & (ring - 1)) == 0, "tail ring (", ring, ") must be a power of two");
-    AITER_CHECK(tail_kv_cache.size(0) * tail_kv_cache.stride(0) < (1LL << 31), "tail_kv_cache too large");
+    // vLLM pads every tail page to the KV-cache page (stride(0) >> 2 * ring * 128) and the
+    // whole tail can exceed 2^31 elements: block offsets are 64-bit, the strides stay 32-bit.
+    AITER_CHECK(tail_kv_cache.stride(0) < (1LL << 31) && tail_kv_cache.stride(1) < (1LL << 31),
+                "tail_kv_cache strides must fit in 32 bits, got ", tail_kv_cache.stride(0), ", ",
+                tail_kv_cache.stride(1));
+    AITER_CHECK(tail_kv_cache.stride(2) == 128 && tail_kv_cache.stride(3) == 1,
+                "tail_kv_cache rows must be contiguous [ring, 128]");
     return TailArgs{static_cast<uint16_t*>(tail_kv_cache.data_ptr()),
                     static_cast<int>(tail_kv_cache.stride(0)),
                     static_cast<int>(tail_kv_cache.stride(1)),

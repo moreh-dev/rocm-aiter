@@ -225,17 +225,24 @@ def make_prefill(lens, pool, page, slot_dtype=torch.int64, seed=0, ring=None, nb
     return k, gate, ape, slot, tslot, kv
 
 
-def make_decode(B, next_n, pool, page=64, seed=0, ring=None, nblocks=None, idx_dtype=torch.int32):
+def make_decode(B, next_n, pool, page=64, seed=0, ring=None, nblocks=None, idx_dtype=torch.int32,
+                tail_pad=1):
     """B requests x next_n consecutive tokens from random context lengths.
     ``idx_dtype`` (int32 / int64) is the dtype of the three metadata tensors
-    (vLLM keeps its slot mappings and positions in int64)."""
+    (vLLM keeps its slot mappings and positions in int64). ``tail_pad`` > 1
+    pads every tail page to ``tail_pad`` rings (vLLM pads the tail page to the
+    KV-cache page, so stride(0) >> 2 * ring * 128 and the tail can exceed 2^31
+    elements): the tail is then a strided view and the requests are spread
+    over all blocks."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     ring = ring or pool
     nblocks = nblocks or B + 2
-    tail = torch.randn(nblocks, 2, ring, HEAD_DIM, generator=g, device="cuda").bfloat16()
+    tail_base = torch.randn(nblocks, 2, ring * tail_pad, HEAD_DIM, generator=g, device="cuda").bfloat16()
+    tail = tail_base[:, :, :ring] if tail_pad > 1 else tail_base
     ctx = torch.randint(pool, 100000, (B,), generator=g, device="cuda")
     pos = (ctx[:, None] + torch.arange(next_n)[None]).to(torch.int32)
-    blocks = torch.arange(B, dtype=torch.int32)[:, None]
+    spread = max(1, (nblocks - 1) // B) if tail_pad > 1 else 1
+    blocks = (torch.arange(B, dtype=torch.int32) * spread)[:, None]
     tail_slot = (blocks * ring + pos % ring).to(torch.int32)
     n_pages = math.ceil(B * next_n / page) + 2
     locs = torch.randperm(n_pages * page, generator=g, device="cuda")[: B * next_n]
@@ -246,8 +253,14 @@ def make_decode(B, next_n, pool, page=64, seed=0, ring=None, nblocks=None, idx_d
     score = torch.randn(B, next_n, HEAD_DIM, generator=g, device="cuda").bfloat16()
     ape = torch.randn(pool, HEAD_DIM, generator=g, device="cuda")
     kv = torch.zeros(n_pages, page, HEAD_DIM + 4, dtype=torch.uint8)
-    return dict(kv=kv, tail=tail, tail_slot=tail_slot.to(idx_dtype), key=key, score=score, ape=ape,
-                slot_map=slot_map.to(idx_dtype), pos=pos.to(idx_dtype), pool=pool)
+    return dict(kv=kv, tail=tail, tail_base=tail_base, tail_slot=tail_slot.to(idx_dtype), key=key, score=score,
+                ape=ape, slot_map=slot_map.to(idx_dtype), pos=pos.to(idx_dtype), pool=pool)
+
+
+def tail_clone(d):
+    """Copy of the tail that keeps a padded tail's strides (clone() would compact the view)."""
+    base = d["tail_base"].clone()
+    return base[:, :, : d["tail"].shape[2]] if d["tail"].shape[2] != base.shape[2] else base
 
 
 def compare_cache(kv_ref, kv_got, msg):
@@ -287,14 +300,16 @@ def test_insert(lens, pool, page, slot_dtype=torch.int64, lanes=0, round_scale=T
 
 
 @benchmark()
-def test_decode(B, next_n, pool, page=64, round_scale=True, ring=None, idx_dtype=torch.int32):
-    d = make_decode(B, next_n, pool, page, seed=B * 100 + next_n, ring=ring, idx_dtype=idx_dtype)
-    kv_ref, tail_ref = d["kv"].clone(), d["tail"].clone()
+def test_decode(B, next_n, pool, page=64, round_scale=True, ring=None, idx_dtype=torch.int32,
+                tail_pad=1, nblocks=None):
+    d = make_decode(B, next_n, pool, page, seed=B * 100 + next_n, ring=ring, idx_dtype=idx_dtype,
+                    tail_pad=tail_pad, nblocks=nblocks)
+    kv_ref, tail_ref = d["kv"].clone(), tail_clone(d)
     ref_decode(kv_ref, tail_ref, d["tail_slot"], d["key"], d["score"], d["ape"],
                d["slot_map"], d["pos"], pool, round_scale)
     # accuracy on one call: with next_n > 1 the update is not idempotent (a
     # second run reads ring slots the first run's stashes overwrote)
-    kv_got, tail_got = d["kv"].clone(), d["tail"].clone()
+    kv_got, tail_got = d["kv"].clone(), tail_clone(d)
     aiter.kpool_decode_update(kv_got, tail_got, d["tail_slot"], d["key"], d["score"],
                               d["ape"], d["slot_map"], d["pos"], pool, round_scale)
     torch.cuda.synchronize()
@@ -302,15 +317,16 @@ def test_decode(B, next_n, pool, page=64, round_scale=True, ring=None, idx_dtype
     tail_ok = torch.equal(tail_ref, tail_got)
     # timing on scratch copies
     _, us = run_perftest(
-        aiter.kpool_decode_update, d["kv"].clone(), d["tail"].clone(), d["tail_slot"], d["key"],
+        aiter.kpool_decode_update, d["kv"].clone(), tail_clone(d), d["tail_slot"], d["key"],
         d["score"], d["ape"], d["slot_map"], d["pos"], pool, round_scale, num_iters=20, num_warmup=2,
     )
-    ret = {"ring": d["tail"].shape[2], "idx": str(idx_dtype).replace("torch.", ""), "err": err,
+    ret = {"ring": d["tail"].shape[2], "idx": str(idx_dtype).replace("torch.", ""),
+           "tail stride0": d["tail"].stride(0), "err": err,
            "scale err": err_s, "diff bytes": diff_bytes, "tail exact": tail_ok, "us": us}
     assert tail_ok, "tail ring mismatch"
     if _VLLM is not None:
         if d["tail"].shape[2] == pool:
-            kv_e, tail_e = d["kv"].clone(), d["tail"].clone()
+            kv_e, tail_e = d["kv"].clone(), tail_clone(d)
             vllm_decode(kv_e, tail_e, d["tail_slot"], d["key"], d["score"], d["ape"],
                         d["slot_map"], d["pos"], pool, round_scale)
             ret["vllm diff bytes"] = int((kv_e != kv_got).sum()) + int((tail_e != tail_got).sum())
@@ -323,29 +339,30 @@ def test_decode(B, next_n, pool, page=64, round_scale=True, ring=None, idx_dtype
 
 
 @benchmark()
-def test_mixed(lens, B, next_n, pool, page=64, round_scale=True, idx_dtype=torch.int64):
+def test_mixed(lens, B, next_n, pool, page=64, round_scale=True, idx_dtype=torch.int64, tail_pad=1):
     ring = pool
     # one index dtype per launch: prefill slot_mapping, seed slots and decode metadata
-    d = make_decode(B, next_n, pool, page, seed=7, ring=ring, nblocks=B + len(lens) + 2, idx_dtype=idx_dtype)
+    d = make_decode(B, next_n, pool, page, seed=7, ring=ring, nblocks=B + len(lens) + 2, idx_dtype=idx_dtype,
+                    tail_pad=tail_pad)
     k, gate, ape, slot, tslot, kv_p = make_prefill(lens, pool, page, idx_dtype, seed=11,
                                                     ring=ring, nblock_offset=B)
     # prefill cache slots live in their own pages, after the decode pages
     slot = torch.where(slot >= 0, slot + d["kv"].shape[0] * page, slot)
     kv = torch.cat([d["kv"], kv_p], 0)
     ape = d["ape"]
-    kv_ref, tail_ref = kv.clone(), d["tail"].clone()
+    kv_ref, tail_ref = kv.clone(), tail_clone(d)
     ref_insert(kv_ref, k, gate, ape, slot, pool, round_scale)
     ref_seed(tail_ref, k, gate, tslot, pool)
     ref_decode(kv_ref, tail_ref, d["tail_slot"], d["key"], d["score"], ape,
                d["slot_map"], d["pos"], pool, round_scale)
-    kv_got, tail_got = kv.clone(), d["tail"].clone()
+    kv_got, tail_got = kv.clone(), tail_clone(d)
     aiter.kpool_mixed_write(kv_got, ape, pool, round_scale, 0, k, gate, slot, tslot, tail_got,
                             d["tail_slot"], d["key"], d["score"], d["slot_map"], d["pos"])
     torch.cuda.synchronize()
     err, err_s, diff_bytes = compare_cache(kv_ref, kv_got, "mixed")
     _, us = run_perftest(
         aiter.kpool_mixed_write, kv.clone(), ape, pool, round_scale, 0,
-        k, gate, slot, tslot, d["tail"].clone(), d["tail_slot"], d["key"], d["score"],
+        k, gate, slot, tslot, tail_clone(d), d["tail_slot"], d["key"], d["score"],
         d["slot_map"], d["pos"], num_iters=20, num_warmup=2,
     )
     tail_ok = torch.equal(tail_ref, tail_got)
@@ -402,12 +419,20 @@ if args.only in (None, "decode"):
         rows.append(test_decode(64, 4, 4))
         rows.append(test_decode(32, 16, 4))
         rows.append(test_decode(64, 1, 4, idx_dtype=torch.int64))
+        # vLLM layout: tail pages padded to the KV page (strided view), offsets past 2^31 elements
+        rows.append(test_decode(64, 1, 4, idx_dtype=torch.int64, tail_pad=16))
+        rows.append(test_decode(5, 4, 4, ring=8, idx_dtype=torch.int64, tail_pad=16))
+        rows.append(test_decode(512, 1, 4, idx_dtype=torch.int64, tail_pad=1024, nblocks=4096))  # 8.6 GB, stride0 2^20
+        rows.append(test_decode(256, 2, 4, ring=8, idx_dtype=torch.int64, tail_pad=512, nblocks=4096))
     tables["decode"] = pd.DataFrame(rows)
 if args.only in (None, "mixed"):
     rows = [test_mixed([64, 9], 1, 1, 4), test_mixed([4096, 17, 300], 8, 4, 4),
             test_mixed([64, 9], 1, 1, 4, idx_dtype=torch.int32), test_mixed([300, 17], 8, 4, 4, idx_dtype=torch.int32)]
     if not args.quick:
         rows.append(test_mixed([2048] * 4, 32, 2, 4))
+        # vLLM layout: padded tail pages (strided view) for the seed + decode roles
+        rows.append(test_mixed([4096, 17, 300], 8, 1, 4, tail_pad=16))
+        rows.append(test_mixed([300, 77], 256, 1, 4, tail_pad=512))
     tables["mixed"] = pd.DataFrame(rows)
 for name, df in tables.items():
     aiter.logger.info("kpool %s summary (markdown):\n%s", name, df.to_markdown(index=False))
