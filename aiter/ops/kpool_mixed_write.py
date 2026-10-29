@@ -35,7 +35,9 @@ def kpool_mixed_write(
     prefill_k: Tensor | None = None,
     prefill_gate: Tensor | None = None,
     prefill_slot_mapping: Tensor | None = None,
-    prefill_tail_slot_mapping: Tensor | None = None,  # [n_tokens], dtype of prefill_slot_mapping: seed the tail ring
+    prefill_tail_slot_mapping: (
+        Tensor | None
+    ) = None,  # [n_tokens], dtype of prefill_slot_mapping: seed the tail ring
     tail_kv_cache: Tensor | None = None,
     # decode metadata: int32 or int64, the dtype of prefill_slot_mapping when both sides are given
     decode_tail_slot_mapping: Tensor | None = None,
