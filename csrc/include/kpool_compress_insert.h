@@ -4,6 +4,7 @@
 
 #include "aiter_tensor.h"
 #include <cstdint>
+#include <optional>
 
 namespace aiter {
 
@@ -19,13 +20,20 @@ namespace aiter {
 
 // Prefill insert: k, gate_score [n_tokens, 128] bf16 (rows may be strided),
 // slot_mapping [n_tokens] int32 / int64 (>= 0 on the token that closes a pool).
+// With tail_kv_cache [num_blocks, 2, ring, 128] bf16 (ring a power of two and
+// a multiple of pool_size) and tail_slot_mapping [n_tokens] (dtype of
+// slot_mapping, < 0 to skip a token) the tokens that end a request's open pool
+// also seed the tail ring (kpool_seed_tail_cache): one call covers the whole
+// prefill step of the indexer.
 void kpool_compress_insert(aiter_tensor_t& kv_cache,
                            const aiter_tensor_t& k,
                            const aiter_tensor_t& gate_score,
                            const aiter_tensor_t& ape,
                            const aiter_tensor_t& slot_mapping,
                            int pool_size,
-                           bool round_scale   = true,
-                           int lanes_per_pool = 0);
+                           bool round_scale                                = true,
+                           int lanes_per_pool                              = 0,
+                           std::optional<aiter_tensor_t> tail_kv_cache     = std::nullopt,
+                           std::optional<aiter_tensor_t> tail_slot_mapping = std::nullopt);
 
 } // namespace aiter

@@ -14,7 +14,9 @@ holds ``page_size * 128`` key bytes (the MFMA 16x16 preshuffled layout of
 The prefill writer ``kpool_compress_insert`` is byte-identical to the vLLM
 Triton path: K / gate are read in place, one window of ``pool_size`` tokens
 per lane group, and only closing pools (``slot_mapping >= 0``) are
-compressed.
+compressed. With ``tail_kv_cache`` / ``tail_slot_mapping`` the same launch
+also seeds the decode tail ring with each request's open pool
+(``kpool_seed_tail_cache``), i.e. the whole prefill step of the indexer.
 """
 
 from torch import Tensor
@@ -46,4 +48,10 @@ def kpool_compress_insert(
     pool_size: int,
     round_scale: bool = True,
     lanes_per_pool: int = 0,  # 0: auto, else 16 / 32 / 64
+    tail_kv_cache: (
+        Tensor | None
+    ) = None,  # [num_blocks, 2, ring, 128] bf16: seed the tail ring
+    tail_slot_mapping: (
+        Tensor | None
+    ) = None,  # [n_tokens], dtype of slot_mapping, < 0 to skip
 ) -> None: ...

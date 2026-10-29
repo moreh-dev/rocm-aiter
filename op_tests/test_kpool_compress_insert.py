@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Accuracy (and timing) of the GLM-5.3-Flash indexer kpool cache writer
-``kpool_compress_insert``.
+"""Accuracy (and timing) of the GLM-5.3-Flash indexer kpool prefill cache writer
+``kpool_compress_insert`` (pool insert, optionally with the tail-ring seeding).
 
-Every case runs a pure-torch reference of the vLLM prefill insert and compares
-the whole kv_cache (dequantized fp8 keys and fp32 scales).
+Every case runs a pure-torch reference of the vLLM prefill step (insert and,
+with ``seed=True``, ``kpool_seed_tail_cache``) and compares the whole kv_cache
+(dequantized fp8 keys and fp32 scales) and the whole tail cache (exact).
 The reference rounds at the same two bf16 points as the kernel; the only
 sources of difference are 1-ulp fp32 choices (exp, division, log2), so the
 dequantized keys agree to one fp8 ulp and the bytes agree exactly for all but
 a handful of tokens. With ``--vllm-ref <path to vllm kpool_compress.py>`` the
-Triton production kernel is run too and compared byte for byte.
+Triton production kernels are run too and compared byte for byte.
 
     python3 test_kpool_compress_insert.py
     python3 test_kpool_compress_insert.py --quick
@@ -117,6 +118,21 @@ def ref_insert(kv, k, gate, ape, slot, pool, round_scale=True):
     write_cache(kv, slot[closing].long(), q, s)
 
 
+def ref_seed(tail, k, gate, tail_slot, pool):
+    """kpool_seed_tail_cache: a token is among the last ``pool`` tokens of its
+    request when the token ``pool`` ahead has no tail slot or another block."""
+    n = k.shape[0]
+    ring = tail.shape[2]
+    ts = tail_slot.long()
+    ahead = torch.full_like(ts, -1)
+    if n > pool:
+        ahead[: n - pool] = ts[pool:]
+    write = (ts >= 0) & ((ahead < 0) | (ahead // ring != ts // ring))
+    idx = write.nonzero().flatten()
+    tail[ts[idx] // ring, 0, ts[idx] % ring] = k[idx]
+    tail[ts[idx] // ring, 1, ts[idx] % ring] = gate[idx]
+
+
 # --------------------------------------------------------------------------
 # optional byte-exact reference: the vLLM Triton kernels
 # --------------------------------------------------------------------------
@@ -155,16 +171,22 @@ def vllm_insert(kv, k, gate, ape, slot, pool, round_scale=True):
     )
 
 
+def vllm_seed(tail, k, gate, tslot, pool):
+    _VLLM.kpool_seed_tail_cache(tail, k, gate, tslot, pool, HEAD_DIM)
+
+
 # --------------------------------------------------------------------------
 # inputs
 # --------------------------------------------------------------------------
 
 
-def make_prefill(lens, pool, page, slot_dtype=torch.int64, seed=0):
+def make_prefill(
+    lens, pool, page, slot_dtype=torch.int64, seed=0, ring=None, nblock_offset=0
+):
     """Varlen prefill batch, pools aligned to each request start, random paged
-    slots."""
+    slots, and the tail slot mapping (request r -> tail block nblock_offset + r)."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    slots = []
+    slots, tslots = [], []
     n_pools = sum(length // pool for length in lens)
     num_blocks = max(1, math.ceil(n_pools / page)) + 2
     perm = torch.randperm(num_blocks * page, device="cuda", generator=g)[
@@ -173,13 +195,34 @@ def make_prefill(lens, pool, page, slot_dtype=torch.int64, seed=0):
     for r, length in enumerate(lens):
         for t in range(length):
             slots.append(perm.pop() if t % pool == pool - 1 else -1)
+            tslots.append((nblock_offset + r) * (ring or pool) + t % (ring or pool))
     n = len(slots)
     k = torch.randn(n, HEAD_DIM, generator=g, device="cuda").bfloat16()
     gate = (torch.randn(n, HEAD_DIM, generator=g, device="cuda") * 3).bfloat16()
     ape = torch.randn(pool, HEAD_DIM, generator=g, device="cuda")
     slot = torch.tensor(slots, dtype=slot_dtype)
+    tslot = torch.tensor(
+        tslots, dtype=slot_dtype
+    )  # the seed slots share the slot_mapping dtype
     kv = torch.zeros(num_blocks, page, HEAD_DIM + 4, dtype=torch.uint8)
-    return k, gate, ape, slot, kv
+    return k, gate, ape, slot, tslot, kv
+
+
+def make_tail(n_requests, ring, tail_pad=1, seed=0):
+    """Random tail ring [n_requests + 2, 2, ring, 128]. ``tail_pad`` > 1 pads every
+    tail page to ``tail_pad`` rings (vLLM pads the tail page to the KV-cache page,
+    so the tail is a strided view); returns (view, base)."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    base = torch.randn(
+        n_requests + 2, 2, ring * tail_pad, HEAD_DIM, generator=g, device="cuda"
+    ).bfloat16()
+    return (base[:, :, :ring] if tail_pad > 1 else base), base
+
+
+def tail_clone(tail, base):
+    """Copy of the tail that keeps a padded tail's strides (clone() would compact the view)."""
+    b = base.clone()
+    return b[:, :, : tail.shape[2]] if tail.shape[2] != b.shape[2] else b
 
 
 def compare_cache(kv_ref, kv_got, msg):
@@ -199,45 +242,93 @@ def compare_cache(kv_ref, kv_got, msg):
 
 
 @benchmark()
-def test_insert(lens, pool, page, slot_dtype=torch.int64, lanes=0, round_scale=True):
-    k, gate, ape, slot, kv = make_prefill(lens, pool, page, slot_dtype)
+def test_insert(
+    lens,
+    pool,
+    page,
+    slot_dtype=torch.int64,
+    lanes=0,
+    round_scale=True,
+    seed=False,
+    ring=None,
+    tail_pad=1,
+):
+    ring = ring or pool
+    k, gate, ape, slot, tslot, kv = make_prefill(
+        lens, pool, page, slot_dtype, ring=ring
+    )
     n = k.shape[0]
+    tail, tail_base = make_tail(len(lens), ring, tail_pad) if seed else (None, None)
     ref = kv.clone()
     ref_insert(ref, k, gate, ape, slot, pool, round_scale)
     got = kv.clone()
-    _, us = run_perftest(
-        aiter.kpool_compress_insert,
-        got,
-        k,
-        gate,
-        ape,
-        slot,
-        pool,
-        round_scale,
-        lanes,
-        num_iters=20,
-        num_warmup=2,
-    )
+    if seed:
+        tail_ref, tail_got = tail_clone(tail, tail_base), tail_clone(tail, tail_base)
+        ref_seed(tail_ref, k, gate, tslot, pool)
+        aiter.kpool_compress_insert(
+            got, k, gate, ape, slot, pool, round_scale, lanes, tail_got, tslot
+        )
+        torch.cuda.synchronize()
+        tail_ok = torch.equal(tail_ref, tail_got)
+        _, us = run_perftest(
+            aiter.kpool_compress_insert,
+            kv.clone(),
+            k,
+            gate,
+            ape,
+            slot,
+            pool,
+            round_scale,
+            lanes,
+            tail_clone(tail, tail_base),
+            tslot,
+            num_iters=20,
+            num_warmup=2,
+        )
+    else:
+        tail_ok = None
+        _, us = run_perftest(
+            aiter.kpool_compress_insert,
+            got,
+            k,
+            gate,
+            ape,
+            slot,
+            pool,
+            round_scale,
+            lanes,
+            num_iters=20,
+            num_warmup=2,
+        )
     err, err_s, diff_bytes = compare_cache(ref, got, "insert")
     ret = {
         "tokens": n,
         "lanes": lanes or kpool_pick_lanes(n, pool),
+        "seed": seed,
+        "ring": ring if seed else None,
+        "tail stride0": tail.stride(0) if seed else None,
         "err": err,
         "scale err": err_s,
         "diff bytes": diff_bytes,
+        "tail exact": tail_ok,
         "us": us,
         "TB/s (K+gate)": n * 2 * HEAD_DIM * 2 / us / 1e6,
     }
+    assert not seed or tail_ok, "tail ring mismatch"
     if _VLLM is not None:
         exact = kv.clone()
         vllm_insert(exact, k, gate, ape, slot, pool, round_scale)
         ret["vllm diff bytes"] = int((exact != got).sum())
+        if seed:
+            tail_e = tail_clone(tail, tail_base)
+            vllm_seed(tail_e, k, gate, tslot, pool)
+            ret["vllm diff bytes"] += int((tail_e != tail_got).sum())
     return ret
 
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
-    description="Test the GLM-5.3-Flash kpool prefill cache writer.",
+    description="Test the GLM-5.3-Flash kpool prefill cache writer (insert + tail seeding).",
 )
 parser.add_argument("--quick", action="store_true", help="fewer and smaller cases")
 parser.add_argument(
@@ -272,9 +363,23 @@ for lanes in (16, 32, 64):
 rows.append(test_insert([1, 7, 130, 1000, 33, 4, 5], 4, 32, slot_dtype=torch.int32))
 rows.append(test_insert([4099, 17, 2048, 3], 3, 32))
 rows.append(test_insert([300, 77, 2048], 4, 64, round_scale=False))
+# insert + tail seeding (the vLLM prefill step): ring == pool and the production
+# rings 8 / 16, int32 / int64 indices, batches shorter than one pool (seed only),
+# ragged chunks, and vLLM's padded tail pages (strided view)
+rows.append(test_insert([64, 9], 4, 64, seed=True))
+rows.append(test_insert([1, 2, 3], 4, 64, seed=True))
+rows.append(
+    test_insert([1, 7, 130, 1000, 33, 4, 5], 4, 32, slot_dtype=torch.int32, seed=True)
+)
+rows.append(test_insert([4096, 17, 300], 4, 64, seed=True, ring=8))
+rows.append(test_insert([300, 17], 4, 64, slot_dtype=torch.int32, seed=True, ring=16))
+rows.append(test_insert([100, 37], 8, 64, seed=True))
+rows.append(test_insert([2048] * 4, 4, 64, seed=True, tail_pad=16))
 if not args.quick:
     rows.append(test_insert([8192] * 8, 4, 64))
     rows.append(test_insert([131072] * 2, 4, 64))
+    rows.append(test_insert([8192] * 8, 4, 64, seed=True, ring=8))
+    rows.append(test_insert([300, 77], 4, 64, seed=True, tail_pad=512))
 tables["insert"] = pd.DataFrame(rows)
 for name, df in tables.items():
     aiter.logger.info(

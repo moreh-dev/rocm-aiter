@@ -2,10 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-Benchmark for the GLM-5.3-Flash indexer kpool prefill cache writer (HIP).
+Benchmark for the GLM-5.3-Flash indexer kpool prefill cache writer (HIP):
+the pool insert, and with --seed-tail the whole prefill step (insert + tail
+ring seeding in one launch).
 
     python bench_kpool_compress_insert.py                         # default sweep
-    python bench_kpool_compress_insert.py --insert-tokens 32768 1048576
+    python bench_kpool_compress_insert.py --insert-tokens 32768 1048576 --seed-tail
     python bench_kpool_compress_insert.py -o results.csv
 
 Timings are triton.testing.do_bench medians (L2 flushed). Bandwidth counts
@@ -54,11 +56,20 @@ def bench(fn, warmup=5, rep=50):
 
 def run_insert(args):
     rows = []
-    print(f"\ninsert (pool {args.pool}, page {args.page})")
+    op = "insert+seed" if args.seed_tail else "insert"
+    print(f"\n{op} (pool {args.pool}, page {args.page}, ring {args.ring or args.pool})")
     print(f"{'tokens':>9} {'lanes':>5} {'us':>9} {'p20':>9} {'p80':>9} {'TB/s':>6}")
     for n in args.insert_tokens:
         k, gate, ape, slot, kv = make_prefill(n, args.pool, args.page)
         lanes = args.lanes or kpool_pick_lanes(n, args.pool)
+        tail = tslot = None
+        if args.seed_tail:
+            # one request in tail block 1: its last pool_size rows are seeded
+            ring = args.ring or args.pool
+            tail = torch.zeros(
+                3, 2, ring, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE
+            )
+            tslot = ring + torch.arange(n, device=DEVICE, dtype=slot.dtype) % ring
         us, p20, p80 = bench(
             functools.partial(
                 aiter.kpool_compress_insert,
@@ -70,11 +81,13 @@ def run_insert(args):
                 args.pool,
                 True,
                 lanes,
+                tail,
+                tslot,
             )
         )
         tbs = n * (2 * HEAD_DIM * 2 + 33) / us / 1e6
         print(f"{n:>9} {lanes:>5} {us:9.2f} {p20:9.2f} {p80:9.2f} {tbs:6.2f}")
-        rows.append(("insert", n, 0, 0, lanes, us, p20, p80, tbs))
+        rows.append((op, n, 0, 0, lanes, us, p20, p80, tbs))
         del k, gate, ape, slot, kv
         torch.cuda.empty_cache()
     return rows
@@ -91,6 +104,17 @@ def main():
         help="force lanes per pool for insert (16/32/64)",
     )
     p.add_argument("--insert-tokens", type=int, nargs="*", default=INSERT_TOKENS)
+    p.add_argument(
+        "--seed-tail",
+        action="store_true",
+        help="also seed the tail ring (the full prefill step)",
+    )
+    p.add_argument(
+        "--ring",
+        type=int,
+        default=0,
+        help="tail ring size for --seed-tail (default pool_size)",
+    )
     p.add_argument("-o", type=str, default=None, help="save results to CSV")
     args = p.parse_args()
 

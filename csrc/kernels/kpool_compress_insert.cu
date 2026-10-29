@@ -2,8 +2,9 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // kpool cache writer for the GLM-5.3-Flash sparse-attention indexer: the
-// prefill insert. Byte-identical to the vLLM Triton path (torch gather +
-// `_kpool_softmax_rotate_write_cache_kernel`).
+// prefill insert, plus the tail-ring seeding of the same step when the tail
+// cache is given. Byte-identical to the vLLM Triton path (torch gather +
+// `_kpool_softmax_rotate_write_cache_kernel`, `kpool_seed_tail_cache`).
 //
 // Semantics: every token t with slot_mapping[t] >= 0 and t >= POOL-1 closes
 // the pool made of tokens [t-POOL+1, t]. For that pool, per head dim d:
@@ -27,6 +28,11 @@
 // lane), 32 (2 pools / wave) or 16 (4 pools / wave, 16 B loads); picked from
 // the token count unless the caller forces it. K / gate are read in place
 // (no [n, POOL, 128] gather) and only pools that really close are compressed.
+// Tail seeding (kpool_seed_tail_cache): with tail_kv_cache / tail_slot_mapping
+// a token among its request's last POOL tokens (the token POOL ahead has
+// another tail block or is past the batch) also copies its raw K / gate row
+// into tail[blk, {0, 1}, slot % ring], from the registers the window already
+// holds, so the next decode step can close that pool.
 //
 // This translation unit is torch-free (AITER_NO_TORCH_TYPES): everything
 // crosses the ABI as aiter_tensor_t.
@@ -422,8 +428,20 @@ __device__ __forceinline__ int xcd_remap(int b, int nb) {
   return x * q + min(x, r) + i;
 }
 
+// Tail ring of the decode step: [num_blocks, 2, ring, 128] bf16, seeded by
+// the prefill tokens that end a request's open pool.
+struct TailArgs {
+  uint16_t* tail;        // strides below in elements
+  int block_elems;       // stride(0) < 2^31 (checked); vLLM pads the tail page to the KV
+  int head_elems;        // stride(1)  page, so block * stride(0) is formed in 64 bits
+  int ring_mask;         // ring - 1; ring = shape[2] is a power of two (checked by the entry point)
+  int ring_shift;        // log2(ring)
+};
+__device__ __forceinline__ int ring_div(int x, const TailArgs& ta) { return x >> ta.ring_shift; }
+__device__ __forceinline__ int ring_mod(int x, const TailArgs& ta) { return x & ta.ring_mask; }
+
 // ===========================================================================
-// Prefill insert window
+// Prefill insert window (+ tail seeding)
 // ===========================================================================
 
 template <int POOL, int LANES, bool VEC, typename SlotT>
@@ -442,13 +460,16 @@ __device__ __forceinline__ void insert_window(
     int page_size,
     int page_shift,
     int64_t page_bytes,
-    int flags,  // bit0: slot int64, bit1: preshuffle, bit2: round_scale
+    int flags,  // bit0: slot int64, bit1: preshuffle, bit2: round_scale, bit3: seed tail
+    const SlotT* __restrict__ seed_tslot,
+    TailArgs ta,
     int grp,
     int sub) {
   constexpr int DPL = HEAD_DIM / LANES;
   static_assert(POOL <= LANES, "one lane per slot in the window");
   const bool preshuffle = flags & 2;
   const bool round_scale = flags & 4;
+  const bool seed = flags & 8;
   const int d0 = sub * DPL;
   const int64_t win_first = win * POOL;
 
@@ -484,6 +505,17 @@ __device__ __forceinline__ void insert_window(
   if (have_window) {
     load_rows<POOL, DPL, VEC>(k, gate, win_first, k_stride, gate_stride, d0, gw, kw);
   }
+  // tail-seed metadata, independent of everything else: issued up front
+  int seed_ts[POOL], seed_ahead[POOL];
+  if (seed && win < n_windows) {
+#pragma unroll
+    for (int s = 0; s < POOL; ++s) {
+      const int64_t tok = win_first + s;
+      seed_ts[s] = tok < n_tokens ? (int)seed_tslot[tok] : -1;
+      seed_ahead[s] = (tok + POOL < n_tokens) ? (int)seed_tslot[tok + POOL] : -1;
+    }
+  }
+
   const int closes = (win < n_windows && sub < POOL && my_tok < n_tokens && my_tok >= POOL - 1 && my_slot >= 0) ? 1 : 0;
   const uint64_t ballot = __ballot(closes);
   uint64_t bits = (ballot >> (grp * LANES)) & ((LANES == 64) ? ~0ull : ((1ull << LANES) - 1));
@@ -512,6 +544,37 @@ __device__ __forceinline__ void insert_window(
     compress_pool<POOL, LANES>(gw, kw, apev, (gptr<uint8_t>)(cache + page * page_bytes), tok,
                                (uint32_t)(page_size * HEAD_DIM + tok * 4), preshuffle, round_scale, sub);
   }
+
+  // Tail seeding (kpool_seed_tail_cache): token i is among its request's last
+  // POOL tokens if the token POOL ahead has another tail block (or is past
+  // the batch / has slot < 0). Its raw K / gate rows go to
+  // tail[blk, {0, 1}, ts % ring]. The rows are already in registers when the
+  // window was preloaded and not clobbered.
+  if (seed && win < n_windows) {
+#pragma unroll
+    for (int s = 0; s < POOL; ++s) {
+      const int64_t tok = win_first + s;
+      if (tok >= n_tokens) break;
+      const int ts = seed_ts[s];
+      if (ts < 0) continue;
+      const int blk = ring_div(ts, ta);
+      const int ahead = seed_ahead[s];
+      if (ahead >= 0 && ring_div(ahead, ta) == blk) continue;
+      uint32_t rk[DPL / 2], rs[DPL / 2];
+      if (have_window) {
+#pragma unroll
+        for (int c = 0; c < DPL / 2; ++c) { rk[c] = kw[s][c]; rs[c] = gw[s][c]; }
+      } else {
+        load_row<DPL, VEC>(k + tok * k_stride + d0, rk);
+        load_row<DPL, VEC>(gate + tok * gate_stride + d0, rs);
+      }
+      const uint64_t dst = (uint64_t)(uint32_t)blk * (uint32_t)ta.block_elems + (uint32_t)(ring_mod(ts, ta) * HEAD_DIM + d0);
+      uint32_t* pk = reinterpret_cast<uint32_t*>(ta.tail + dst);
+      uint32_t* ps = reinterpret_cast<uint32_t*>(ta.tail + (uint32_t)ta.head_elems + dst);
+#pragma unroll
+      for (int c = 0; c < DPL / 2; ++c) { pk[c] = rk[c]; ps[c] = rs[c]; }
+    }
+  }
 }
 
 
@@ -533,6 +596,8 @@ __global__ void __launch_bounds__(64) kpool_insert_kernel(
     int page_size,
     int page_shift,
     int64_t page_bytes,
+    const void* __restrict__ seed_tslot,  // [n_tokens] SlotT, with flags bit3
+    TailArgs ta,
     int flags) {
   constexpr int GROUPS_PER_WAVE = 64 / LANES;
   const int lane = threadIdx.x;
@@ -540,7 +605,8 @@ __global__ void __launch_bounds__(64) kpool_insert_kernel(
   const int sub = lane % LANES;
   const int64_t win = (int64_t)xcd_remap<8>(blockIdx.x, gridDim.x) * GROUPS_PER_WAVE + grp;
   insert_window<POOL, LANES, VEC, SlotT>(win, k, gate, ape, slot_mapping, cache, n_tokens, n_windows, k_stride,
-                                         gate_stride, ape_stride, page_size, page_shift, page_bytes, flags, grp, sub);
+                                         gate_stride, ape_stride, page_size, page_shift, page_bytes, flags,
+                                         reinterpret_cast<const SlotT*>(seed_tslot), ta, grp, sub);
 }
 
 // ===========================================================================
@@ -554,7 +620,7 @@ inline int page_shift_of(int page_size) {
 template <int POOL, int LANES, bool VEC, typename SlotT>
 int launch_insert_t(const void* k, const void* gate, const void* ape, const void* slot, void* cache,
                     int64_t n_tokens, int64_t k_stride, int64_t gate_stride, int64_t ape_stride, int page_size,
-                    int64_t page_bytes, int flags, hipStream_t stream) {
+                    int64_t page_bytes, const void* seed_tslot, TailArgs ta, int flags, hipStream_t stream) {
   constexpr int GROUPS_PER_WAVE = 64 / LANES;
   const int64_t n_windows = (n_tokens + POOL - 1) / POOL;
   const int64_t grid = (n_windows + GROUPS_PER_WAVE - 1) / GROUPS_PER_WAVE;
@@ -562,17 +628,18 @@ int launch_insert_t(const void* k, const void* gate, const void* ape, const void
   hipLaunchKernelGGL((kpool_insert_kernel<POOL, LANES, VEC, SlotT>), dim3((unsigned)grid), dim3(64), 0, stream,
                      (const uint16_t*)k, (const uint16_t*)gate, (const float*)ape, slot, (uint8_t*)cache, n_tokens,
                      n_windows, k_stride, gate_stride, ape_stride, page_size, page_shift_of(page_size), page_bytes,
-                     flags);
+                     seed_tslot, ta, flags);
   return (int)hipGetLastError();
 }
 
 template <int POOL, int LANES>
 int launch_insert_l(bool vec, bool i64, const void* k, const void* gate, const void* ape, const void* slot,
                     void* cache, int64_t n_tokens, int64_t k_stride, int64_t gate_stride, int64_t ape_stride,
-                    int page_size, int64_t page_bytes, int flags, hipStream_t stream) {
+                    int page_size, int64_t page_bytes, const void* seed_tslot, TailArgs ta, int flags,
+                    hipStream_t stream) {
 #define KPOOL_I(V, S)                                                                                          \
   return launch_insert_t<POOL, LANES, V, S>(k, gate, ape, slot, cache, n_tokens, k_stride, gate_stride, ape_stride, \
-                                            page_size, page_bytes, flags, stream);
+                                            page_size, page_bytes, seed_tslot, ta, flags, stream);
   if (vec && i64) { KPOOL_I(true, int64_t) }
   if (vec) { KPOOL_I(true, int32_t) }
   if (i64) { KPOOL_I(false, int64_t) }
@@ -583,11 +650,12 @@ int launch_insert_l(bool vec, bool i64, const void* k, const void* gate, const v
 template <int POOL>
 int launch_insert(int lanes, bool vec, bool i64, const void* k, const void* gate, const void* ape, const void* slot,
                   void* cache, int64_t n_tokens, int64_t k_stride, int64_t gate_stride, int64_t ape_stride,
-                  int page_size, int64_t page_bytes, int flags, hipStream_t stream) {
+                  int page_size, int64_t page_bytes, const void* seed_tslot, TailArgs ta, int flags,
+                  hipStream_t stream) {
 #define KPOOL_L(L)                                                                                              \
   if (lanes == L)                                                                                               \
     return launch_insert_l<POOL, L>(vec, i64, k, gate, ape, slot, cache, n_tokens, k_stride, gate_stride,       \
-                                    ape_stride, page_size, page_bytes, flags, stream);
+                                    ape_stride, page_size, page_bytes, seed_tslot, ta, flags, stream);
 #ifdef KPOOL_ISA_QUICK
   KPOOL_L(64)
 #else
@@ -691,6 +759,30 @@ bool slot_is_i64(const aiter_tensor_t& slot_mapping)
     return slot_mapping.dtype() == AITER_DTYPE_i64;
 }
 
+TailArgs tail_args(const aiter_tensor_t& tail_kv_cache, int pool_size)
+{
+    AITER_CHECK(tail_kv_cache.dtype() == AITER_DTYPE_bf16 && tail_kv_cache.dim() == 4 &&
+                    tail_kv_cache.size(1) == 2 && tail_kv_cache.size(3) == KPOOL_HEAD_DIM &&
+                    tail_kv_cache.stride(3) == 1 && tail_kv_cache.stride(2) == KPOOL_HEAD_DIM,
+                "tail_kv_cache must be bf16 [num_blocks, 2, ring, 128] with contiguous rows");
+    const int ring = static_cast<int>(tail_kv_cache.size(2));
+    AITER_CHECK(ring >= pool_size && ring % pool_size == 0 && (ring & (ring - 1)) == 0,
+                "tail ring (", ring, ") must be a power of two and a multiple of pool_size (", pool_size, ")");
+    // vLLM pads every tail page to the KV-cache page (stride(0) >> 2 * ring * 128) and the
+    // whole tail can exceed 2^31 elements: block offsets are 64-bit, the strides stay 32-bit.
+    AITER_CHECK(tail_kv_cache.stride(0) < (1LL << 31) && tail_kv_cache.stride(1) < (1LL << 31),
+                "tail_kv_cache strides must fit in 32 bits, got ", tail_kv_cache.stride(0), ", ",
+                tail_kv_cache.stride(1));
+    AITER_CHECK(aligned(tail_kv_cache.data_ptr(), tail_kv_cache.stride(0), 2, 4) &&
+                    aligned(tail_kv_cache.data_ptr(), tail_kv_cache.stride(1), 2, 4),
+                "tail_kv_cache rows must be 4-byte aligned");
+    return TailArgs{static_cast<uint16_t*>(tail_kv_cache.data_ptr()),
+                    static_cast<int>(tail_kv_cache.stride(0)),
+                    static_cast<int>(tail_kv_cache.stride(1)),
+                    ring - 1,
+                    __builtin_ctz(static_cast<unsigned>(ring))};
+}
+
 } // namespace
 
 void kpool_compress_insert(aiter_tensor_t& kv_cache,
@@ -700,7 +792,9 @@ void kpool_compress_insert(aiter_tensor_t& kv_cache,
                            const aiter_tensor_t& slot_mapping,
                            int pool_size,
                            bool round_scale,
-                           int lanes_per_pool)
+                           int lanes_per_pool,
+                           std::optional<aiter_tensor_t> tail_kv_cache,
+                           std::optional<aiter_tensor_t> tail_slot_mapping)
 {
     check_cache(kv_cache);
     check_rows(k, "k");
@@ -710,12 +804,26 @@ void kpool_compress_insert(aiter_tensor_t& kv_cache,
     const bool i64 = slot_is_i64(slot_mapping);
     AITER_CHECK(slot_mapping.size(0) == k.size(0), "slot_mapping must have one entry per token");
     const int64_t n_tokens = k.size(0);
-    if(n_tokens < pool_size)
+    // tail seeding: the tokens that end a request's open pool copy their raw rows
+    // into the tail ring (a batch shorter than one pool still seeds)
+    const bool seed = tail_kv_cache.has_value() || tail_slot_mapping.has_value();
+    AITER_CHECK(!seed || (tail_kv_cache.has_value() && tail_slot_mapping.has_value()),
+                "tail_kv_cache and tail_slot_mapping are required together");
+    TailArgs ta{nullptr, 0, 0, 0, 0};
+    const void* seed_tslot = nullptr;
+    if(seed)
+    {
+        AITER_CHECK(slot_is_i64(*tail_slot_mapping) == i64 && tail_slot_mapping->size(0) == n_tokens,
+                    "tail_slot_mapping must be a contiguous [n_tokens] tensor with the dtype of slot_mapping");
+        ta         = tail_args(*tail_kv_cache, pool_size);
+        seed_tslot = tail_slot_mapping->data_ptr();
+    }
+    if(n_tokens == 0 || (n_tokens < pool_size && !seed))
         return;
     const int lanes = lanes_per_pool > 0 ? lanes_per_pool : kpool_pick_lanes(n_tokens, pool_size);
     const int page_size = static_cast<int>(kv_cache.size(1));
     const bool vec = aligned(k.data_ptr(), k.stride(0), 2, 16) && aligned(gate_score.data_ptr(), gate_score.stride(0), 2, 16);
-    const int flags = (i64 ? 1 : 0) | (page_size > 1 ? 2 : 0) | (round_scale ? 4 : 0);
+    const int flags = (i64 ? 1 : 0) | (page_size > 1 ? 2 : 0) | (round_scale ? 4 : 0) | (seed ? 8 : 0);
 
     HipDeviceGuard device_guard(kv_cache.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -723,7 +831,7 @@ void kpool_compress_insert(aiter_tensor_t& kv_cache,
     KPOOL_POOL_SWITCH(rc = launch_insert<P>(lanes, vec, i64, k.data_ptr(), gate_score.data_ptr(), ape.data_ptr(),
                                             slot_mapping.data_ptr(), kv_cache.data_ptr(), n_tokens, k.stride(0),
                                             gate_score.stride(0), ape.stride(0), page_size, kv_cache.stride(0),
-                                            flags, stream); break;)
+                                            seed_tslot, ta, flags, stream); break;)
     check_rc(rc, "kpool_compress_insert");
 }
 
