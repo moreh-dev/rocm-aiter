@@ -149,6 +149,7 @@ else:
     from .ops.cache import *
     from .ops.kpool_decode_update import *
     from .ops.kpool_compress_insert import *
+    from .ops.kpool_mixed_write import *
     from .ops.rmsnorm import *
     from .ops.communication import *
     from .ops.rope import *

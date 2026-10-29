@@ -1175,6 +1175,19 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_kpool_mixed_write": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/kpool_mixed_write_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/kpool_mixed_write.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_sample": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/sample_pybind.cu'",

@@ -2976,3 +2976,23 @@ namespace py = pybind11;
           py::arg("pool_size"),                                                                \
           py::arg("round_scale")    = true,                                                    \
           py::arg("lanes_per_pool") = 0);
+
+#define KPOOL_MIXED_WRITE_PYBIND                                                                  \
+    m.def("kpool_mixed_write",                                                                 \
+          &aiter::kpool_mixed_write,                                                           \
+          "GLM-5.3-Flash indexer kpool insert + tail seed + decode in one launch",             \
+          py::arg("kv_cache"),                                                                 \
+          py::arg("ape"),                                                                      \
+          py::arg("pool_size"),                                                                \
+          py::arg("round_scale")               = true,                                         \
+          py::arg("lanes_per_pool")            = 0,                                            \
+          py::arg("prefill_k")                 = py::none(),                                   \
+          py::arg("prefill_gate")              = py::none(),                                   \
+          py::arg("prefill_slot_mapping")      = py::none(),                                   \
+          py::arg("prefill_tail_slot_mapping") = py::none(),                                   \
+          py::arg("tail_kv_cache")             = py::none(),                                   \
+          py::arg("decode_tail_slot_mapping")  = py::none(),                                   \
+          py::arg("decode_key")                = py::none(),                                   \
+          py::arg("decode_gate")               = py::none(),                                   \
+          py::arg("decode_slot_mapping")       = py::none(),                                   \
+          py::arg("decode_positions")          = py::none());
