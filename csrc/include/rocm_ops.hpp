@@ -2948,3 +2948,18 @@ namespace py = pybind11;
           py::arg("split_lse"),         \
           py::arg("final_output"),      \
           py::arg("attn_sink") = py::none());
+
+#define KPOOL_DECODE_UPDATE_PYBIND                                                                  \
+    m.def("kpool_decode_update",                                                               \
+          &aiter::kpool_decode_update,                                                         \
+          "GLM-5.3-Flash indexer kpool decode update (tail ring stash + pool close)",          \
+          py::arg("kv_cache"),                                                                 \
+          py::arg("tail_kv_cache"),                                                            \
+          py::arg("tail_slot_mapping"),                                                        \
+          py::arg("key"),                                                                      \
+          py::arg("slot_score"),                                                               \
+          py::arg("ape"),                                                                      \
+          py::arg("slot_mapping"),                                                             \
+          py::arg("positions"),                                                                \
+          py::arg("pool_size"),                                                                \
+          py::arg("round_scale") = true);
