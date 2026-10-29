@@ -213,12 +213,13 @@ def run_torch(q, kv_cache_fp8, weights, context_lens, block_tables, max_model_le
 
 
 def _build_inputs(batch_size, next_n, heads, head_dim, avg_kv_length, block_size,
-                  var_ratio=0.0, seed=0):
+                  var_ratio=0.0, seed=0, max_model_len=None):
     torch.manual_seed(seed)
     random.seed(seed)
     fp8_dtype = get_fp8_e4m3_dtype()
 
-    max_model_len = 2 * avg_kv_length
+    if max_model_len is None:
+        max_model_len = 2 * avg_kv_length
     if var_ratio == 0.0:
         context_lens = torch.full(
             (batch_size,), avg_kv_length, device="cuda", dtype=torch.int32
@@ -232,6 +233,9 @@ def _build_inputs(batch_size, next_n, heads, head_dim, avg_kv_length, block_size
         hi = int((1 + var_ratio) * avg_kv_length) + 1
         context_lens = torch.randint(lo, hi, (batch_size,)).cuda().to(torch.int32)
     context_lens = context_lens.clamp(min=next_n)
+    assert int(context_lens.max().item()) <= max_model_len, (
+        f"a context of {int(context_lens.max().item())} is past max_model_len={max_model_len}"
+    )
 
     blocks_per_seq = (context_lens.to(torch.int64) + block_size - 1) // block_size
     max_block_len = int(blocks_per_seq.max().item())
@@ -269,7 +273,7 @@ def _build_inputs(batch_size, next_n, heads, head_dim, avg_kv_length, block_size
 @benchmark()
 def test_fp8_paged_mqa_logits(batch_size, next_n, heads, head_dim, avg_kv_length,
                               block_size, var_ratio, flydsl_tune=False,
-                              timing="perftest", cold=False):
+                              timing="perftest", cold=False, max_model_len=None):
     (
         q,
         q_fp8,
@@ -280,7 +284,7 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, heads, head_dim, avg_kv_length
         max_model_len,
         fp8_dtype,
     ) = _build_inputs(batch_size, next_n, heads, head_dim, avg_kv_length, block_size,
-                      var_ratio=var_ratio)
+                      var_ratio=var_ratio, max_model_len=max_model_len)
 
     ref = run_torch(q, kv_cache_fp8, weights, context_lens, block_tables,
                     max_model_len, fp8_dtype, block_size)
@@ -358,7 +362,9 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, heads, head_dim, avg_kv_length
         rows * heads * head_dim * q_fp8.element_size()  # Q
         + total_ctx * (head_dim + 4)  # K bytes + co-packed f32 scales
         + rows * heads * 4  # weights
-        + rows * max_model_len * 4  # output
+        # output: the causal windows the kernels write (row r of a sequence of length c
+        # covers c - next_n + r + 1 positions), not the whole max_model_len row
+        + (next_n * total_ctx - batch_size * next_n * (next_n - 1) // 2) * 4
     )
 
     ret = {"gfx": get_gfx()}
@@ -419,6 +425,13 @@ def main():
     )
     parser.add_argument("--kv-block-size", type=int, nargs="*", default=[64])
     parser.add_argument(
+        "--max-model-len", type=int, default=None,
+        help="max_model_len for every case (default: 2 x --kv-len). The HIP launcher\n"
+             "sizes its grid from batch x max_model_len, so pass what the serving engine\n"
+             "passes, e.g. 262208 for GLM-5.3-Flash's k-pool indexer in SGLang under CUDA\n"
+             "graphs (1M context / kpool 4 = 4097 pages of 64)",
+    )
+    parser.add_argument(
         "--var-ratio", type=float, nargs="*", default=[0.0, 0.3],
         help="context-length spread within a batch: 0 is uniform, 0.3 draws each\n"
              "sequence from +/-30%% of --kv-len (the normal serving case)",
@@ -453,7 +466,8 @@ def main():
         try:
             df.append(test_fp8_paged_mqa_logits(b, nn, h, hd, kv, kvb, vr,
                                                 args.flydsl_tune, args.timing,
-                                                args.cold))
+                                                args.cold,
+                                                max_model_len=args.max_model_len))
         except torch.OutOfMemoryError:
             # The long-context corner needs several GiB for the cache plus one
             # output buffer per candidate. Record what was dropped rather than
