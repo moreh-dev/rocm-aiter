@@ -2948,3 +2948,16 @@ namespace py = pybind11;
           py::arg("split_lse"),         \
           py::arg("final_output"),      \
           py::arg("attn_sink") = py::none());
+
+#define KPOOL_COMPRESS_INSERT_PYBIND                                                                  \
+    m.def("kpool_compress_insert",                                                             \
+          &aiter::kpool_compress_insert,                                                       \
+          "GLM-5.3-Flash indexer kpool prefill insert (bit-exact with the vLLM Triton path)", \
+          py::arg("kv_cache"),                                                                 \
+          py::arg("k"),                                                                        \
+          py::arg("gate_score"),                                                               \
+          py::arg("ape"),                                                                      \
+          py::arg("slot_mapping"),                                                             \
+          py::arg("pool_size"),                                                                \
+          py::arg("round_scale")    = true,                                                    \
+          py::arg("lanes_per_pool") = 0);
