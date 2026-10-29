@@ -141,9 +141,17 @@ def vllm_insert(kv, k, gate, ape, slot, pool, round_scale=True):
     write_mask = (slot >= 0) & (t >= pool - 1)
     idx = (t - (pool - 1)).clamp_min(0)[:, None] + torch.arange(pool)[None]
     _VLLM.kpool_compress_and_write_cache(
-        kv, k[idx], gate[idx], ape, slot.to(torch.int64), pool_size=pool,
-        head_dim=HEAD_DIM, write_mask=write_mask, round_scale=round_scale,
-        write_cache=True, return_compressed=False,
+        kv,
+        k[idx],
+        gate[idx],
+        ape,
+        slot.to(torch.int64),
+        pool_size=pool,
+        head_dim=HEAD_DIM,
+        write_mask=write_mask,
+        round_scale=round_scale,
+        write_cache=True,
+        return_compressed=False,
     )
 
 
@@ -159,7 +167,9 @@ def make_prefill(lens, pool, page, slot_dtype=torch.int64, seed=0):
     slots = []
     n_pools = sum(length // pool for length in lens)
     num_blocks = max(1, math.ceil(n_pools / page)) + 2
-    perm = torch.randperm(num_blocks * page, device="cuda", generator=g)[:n_pools].tolist()
+    perm = torch.randperm(num_blocks * page, device="cuda", generator=g)[
+        :n_pools
+    ].tolist()
     for r, length in enumerate(lens):
         for t in range(length):
             slots.append(perm.pop() if t % pool == pool - 1 else -1)
@@ -175,7 +185,9 @@ def make_prefill(lens, pool, page, slot_dtype=torch.int64, seed=0):
 def compare_cache(kv_ref, kv_got, msg):
     y_ref, s_ref = read_cache(kv_ref)
     y_got, s_got = read_cache(kv_got)
-    err = checkAllclose(y_ref, y_got, rtol=0.13, atol=2e-3, msg=f"{msg} keys (dequantized)")
+    err = checkAllclose(
+        y_ref, y_got, rtol=0.13, atol=2e-3, msg=f"{msg} keys (dequantized)"
+    )
     err_s = checkAllclose(s_ref, s_got, rtol=1e-6, atol=0, msg=f"{msg} scales")
     diff_bytes = int((kv_ref != kv_got).sum())
     return err, err_s, diff_bytes
@@ -194,13 +206,28 @@ def test_insert(lens, pool, page, slot_dtype=torch.int64, lanes=0, round_scale=T
     ref_insert(ref, k, gate, ape, slot, pool, round_scale)
     got = kv.clone()
     _, us = run_perftest(
-        aiter.kpool_compress_insert, got, k, gate, ape, slot, pool, round_scale, lanes,
-        num_iters=20, num_warmup=2,
+        aiter.kpool_compress_insert,
+        got,
+        k,
+        gate,
+        ape,
+        slot,
+        pool,
+        round_scale,
+        lanes,
+        num_iters=20,
+        num_warmup=2,
     )
     err, err_s, diff_bytes = compare_cache(ref, got, "insert")
-    ret = {"tokens": n, "lanes": lanes or kpool_pick_lanes(n, pool), "err": err,
-           "scale err": err_s, "diff bytes": diff_bytes, "us": us,
-           "TB/s (K+gate)": n * 2 * HEAD_DIM * 2 / us / 1e6}
+    ret = {
+        "tokens": n,
+        "lanes": lanes or kpool_pick_lanes(n, pool),
+        "err": err,
+        "scale err": err_s,
+        "diff bytes": diff_bytes,
+        "us": us,
+        "TB/s (K+gate)": n * 2 * HEAD_DIM * 2 / us / 1e6,
+    }
     if _VLLM is not None:
         exact = kv.clone()
         vllm_insert(exact, k, gate, ape, slot, pool, round_scale)
@@ -213,14 +240,24 @@ parser = argparse.ArgumentParser(
     description="Test the GLM-5.3-Flash kpool prefill cache writer.",
 )
 parser.add_argument("--quick", action="store_true", help="fewer and smaller cases")
-parser.add_argument("--pool", type=int, nargs="*", default=[4, 2, 3, 8, 16], help="pool sizes")
-parser.add_argument("--page", type=int, nargs="*", default=[64, 1], help="cache page sizes")
-parser.add_argument("--vllm-ref", type=str, default=None,
-                    help="path to vllm's kpool_compress.py: also compare byte for byte")
+parser.add_argument(
+    "--pool", type=int, nargs="*", default=[4, 2, 3, 8, 16], help="pool sizes"
+)
+parser.add_argument(
+    "--page", type=int, nargs="*", default=[64, 1], help="cache page sizes"
+)
+parser.add_argument(
+    "--vllm-ref",
+    type=str,
+    default=None,
+    help="path to vllm's kpool_compress.py: also compare byte for byte",
+)
 args = parser.parse_args()
 
 if get_gfx() != "gfx950":
-    aiter.logger.info("kpool writers target gfx950 (fp8 e4m3fn, permlane swaps); skipping")
+    aiter.logger.info(
+        "kpool writers target gfx950 (fp8 e4m3fn, permlane swaps); skipping"
+    )
     sys.exit(0)
 if args.vllm_ref:
     load_vllm_ref(args.vllm_ref)
@@ -240,4 +277,6 @@ if not args.quick:
     rows.append(test_insert([131072] * 2, 4, 64))
 tables["insert"] = pd.DataFrame(rows)
 for name, df in tables.items():
-    aiter.logger.info("kpool %s summary (markdown):\n%s", name, df.to_markdown(index=False))
+    aiter.logger.info(
+        "kpool %s summary (markdown):\n%s", name, df.to_markdown(index=False)
+    )

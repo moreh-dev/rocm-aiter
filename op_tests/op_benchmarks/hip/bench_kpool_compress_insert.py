@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -17,6 +16,7 @@ the compulsory bytes only: 512 B read + 33 B written per prefill token
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 from pathlib import Path
 
@@ -46,7 +46,9 @@ def make_prefill(n_tokens, pool, page, seed=0):
 
 
 def bench(fn, warmup=5, rep=50):
-    ms, p20, p80 = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.2, 0.8])
+    ms, p20, p80 = triton.testing.do_bench(
+        fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.2, 0.8]
+    )
     return ms * 1e3, p20 * 1e3, p80 * 1e3
 
 
@@ -57,7 +59,19 @@ def run_insert(args):
     for n in args.insert_tokens:
         k, gate, ape, slot, kv = make_prefill(n, args.pool, args.page)
         lanes = args.lanes or kpool_pick_lanes(n, args.pool)
-        us, p20, p80 = bench(lambda: aiter.kpool_compress_insert(kv, k, gate, ape, slot, args.pool, True, lanes))
+        us, p20, p80 = bench(
+            functools.partial(
+                aiter.kpool_compress_insert,
+                kv,
+                k,
+                gate,
+                ape,
+                slot,
+                args.pool,
+                True,
+                lanes,
+            )
+        )
         tbs = n * (2 * HEAD_DIM * 2 + 33) / us / 1e6
         print(f"{n:>9} {lanes:>5} {us:9.2f} {p20:9.2f} {p80:9.2f} {tbs:6.2f}")
         rows.append(("insert", n, 0, 0, lanes, us, p20, p80, tbs))
@@ -70,7 +84,12 @@ def main():
     p = argparse.ArgumentParser(description="Benchmark the kpool prefill cache writer.")
     p.add_argument("--pool", type=int, default=4)
     p.add_argument("--page", type=int, default=64)
-    p.add_argument("--lanes", type=int, default=0, help="force lanes per pool for insert (16/32/64)")
+    p.add_argument(
+        "--lanes",
+        type=int,
+        default=0,
+        help="force lanes per pool for insert (16/32/64)",
+    )
     p.add_argument("--insert-tokens", type=int, nargs="*", default=INSERT_TOKENS)
     p.add_argument("-o", type=str, default=None, help="save results to CSV")
     args = p.parse_args()
@@ -81,7 +100,19 @@ def main():
 
         with Path(args.o).open("w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["op", "tokens", "batch", "next_n", "lanes", "us", "p20_us", "p80_us", "TB_s"])
+            w.writerow(
+                [
+                    "op",
+                    "tokens",
+                    "batch",
+                    "next_n",
+                    "lanes",
+                    "us",
+                    "p20_us",
+                    "p80_us",
+                    "TB_s",
+                ]
+            )
             w.writerows(rows)
         print(f"\nsaved {len(rows)} rows to {args.o}")
 
