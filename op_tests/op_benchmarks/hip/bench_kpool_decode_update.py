@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -17,6 +16,7 @@ the compulsory bytes only: per decode request 512 B K/gate + 512 B stash
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 from pathlib import Path
 
@@ -52,7 +52,9 @@ def make_decode(B, next_n, pool, page, seed=0):
 
 
 def bench(fn, warmup=5, rep=50):
-    ms, p20, p80 = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.2, 0.8])
+    ms, p20, p80 = triton.testing.do_bench(
+        fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.2, 0.8]
+    )
     return ms * 1e3, p20 * 1e3, p80 * 1e3
 
 
@@ -62,8 +64,23 @@ def run_decode(args):
     print(f"{'B':>6} {'next_n':>6} {'us':>9} {'p20':>9} {'p80':>9} {'TB/s':>6}")
     for B in args.decode_batch:
         for next_n in args.decode_next_n:
-            kv, tail, tail_slot, key, score, ape, slot_map, pos = make_decode(B, next_n, args.pool, args.page)
-            us, p20, p80 = bench(lambda: aiter.kpool_decode_update(kv, tail, tail_slot, key, score, ape, slot_map, pos, args.pool))
+            kv, tail, tail_slot, key, score, ape, slot_map, pos = make_decode(
+                B, next_n, args.pool, args.page
+            )
+            us, p20, p80 = bench(
+                functools.partial(
+                    aiter.kpool_decode_update,
+                    kv,
+                    tail,
+                    tail_slot,
+                    key,
+                    score,
+                    ape,
+                    slot_map,
+                    pos,
+                    args.pool,
+                )
+            )
             closes = int((slot_map >= 0).sum())
             nbytes = B * next_n * 1024 + closes * (1536 + 132)
             tbs = nbytes / us / 1e6
@@ -87,7 +104,19 @@ def main():
 
         with Path(args.o).open("w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["op", "tokens", "batch", "next_n", "lanes", "us", "p20_us", "p80_us", "TB_s"])
+            w.writerow(
+                [
+                    "op",
+                    "tokens",
+                    "batch",
+                    "next_n",
+                    "lanes",
+                    "us",
+                    "p20_us",
+                    "p80_us",
+                    "TB_s",
+                ]
+            )
             w.writerows(rows)
         print(f"\nsaved {len(rows)} rows to {args.o}")
 
