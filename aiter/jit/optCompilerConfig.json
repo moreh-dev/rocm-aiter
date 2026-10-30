@@ -2087,7 +2087,8 @@
     "module_fp8_mqa_logits": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fp8_mqa_logits_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/fp8_mqa_logits.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/fp8_mqa_logits.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fp8_mqa_logits_topk.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

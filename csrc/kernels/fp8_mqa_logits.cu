@@ -77,12 +77,17 @@ __device__ __forceinline__ f8x32 pack(f8x16 lo, f8x16 hi) {
     f8x32 v; *reinterpret_cast<f8x16*>(&v) = lo; *(reinterpret_cast<f8x16*>(&v) + 1) = hi; return v;
 }
 
-template <int NUM_WARPS, int SUB, int PF, bool CLEAN_LOGITS, bool REVERSE_ROWS>
+// HI16: store only the high 16 bits of each fp32 logit (the order key the top-k reads); no -inf fill.
+template <int NUM_WARPS, int SUB, int PF, bool CLEAN_LOGITS, bool REVERSE_ROWS, bool HI16>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE)
 void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const float* __restrict__ kv_scale_ptr,
             const float* __restrict__ W_ptr, const int* __restrict__ ks_ptr, const int* __restrict__ ke_ptr,
-            float* __restrict__ logits_ptr, int M, int N, int SplitN)
+            void* __restrict__ out_ptr, int M, int N, int SplitN)
 {
+    static_assert(!(HI16 && CLEAN_LOGITS), "16-bit logits are only read inside [ks, ke)");
+    using OutT = std::conditional_t<HI16, uint16_t, float>;
+    constexpr int ES = sizeof(OutT);
+    OutT* __restrict__ logits_ptr = static_cast<OutT*>(out_ptr);
     constexpr int BLOCK_M    = 4;
     constexpr int ROWS_WG    = BLOCK_M * NUM_WARPS;
     constexpr int TILE_N     = 32;
@@ -163,7 +168,7 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
     const int n_masked = tc0 + (num_tiles - tc1);               // stages [0,tc0) U [tc1,num_tiles), contiguous index space
     const float NEG_INF   = -__builtin_huge_valf();
 
-    if constexpr (CLEAN_LOGITS) {
+    if constexpr (CLEAN_LOGITS && !HI16) {
         if (pid_split == 0) {   // -inf for [0, lo) and [tile_end, N) of my rows (wave-local, 64 lanes)
             const f32x4 vneg = {NEG_INF, NEG_INF, NEG_INF, NEG_INF};
             auto fill_range = [&](float* row, int64_t row_base, int a, int b) {
@@ -204,12 +209,23 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
     const i32x4 k_v = raw_rsrc(K_ptr, N * HEAD_SIZE);
     const i32x4 s_v = raw_rsrc(kv_scale_ptr, N * 4);
     __amdgpu_buffer_rsrc_t o_rsrc[BLOCK_M / 2];
+    i32x4 o_v[BLOCK_M / 2];
     #pragma unroll
     for (int r = 0; r < BLOCK_M; r += 2) {
         const int row = __builtin_amdgcn_readfirstlane(min(m0 + r, M - 1));
-        o_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)(logits_ptr + (int64_t)row * N), 0, 2 * N * 4, BUF_RSRC_WORD3);
+        if constexpr (HI16) o_v[r / 2] = raw_rsrc(logits_ptr + (int64_t)row * N, 2 * N * ES);
+        else o_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)(logits_ptr + (int64_t)row * N), 0, 2 * N * ES, BUF_RSRC_WORD3);
     }
-    const int o_voff = hset * N * 4 + jtok * 4;
+    const int o_voff = hset * N * ES + jtok * ES;
+    // HI16: buffer_store_short_d16_hi stores the high half straight from the fp32 VGPR (the compiler's (bits >> 16)
+    // costs a v_lshrrev per store). Still one VMEM op per store, so the hand-placed vmcnt counts hold.
+    auto store_out = [&](float v, int r, unsigned voff, int token_base) {
+        if constexpr (HI16)
+            asm volatile("buffer_store_short_d16_hi %0, %1, %2, %3 offen"
+                         :: "v"(v), "v"(voff), "s"(o_v[r / 2]), "s"(token_base * ES) : "memory");
+        else
+            __builtin_amdgcn_raw_buffer_store_b32(__builtin_bit_cast(unsigned, v), o_rsrc[r / 2], voff, token_base * ES, 0);
+    };
 
     // ---- producer mapping: chunk c (16 B) of the tile: token c/8, 16-B piece c%8 ----
     // Each lane copies CPL chunks; the LDS destination XOR-swizzles the piece index by (token & 7).
@@ -284,7 +300,7 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
         constexpr bool MASKED = decltype(masked_c)::value;
         const float res = (p0 + p1) * scale;
         if constexpr (!MASKED) {
-            __builtin_amdgcn_raw_buffer_store_b32(__builtin_bit_cast(unsigned, res), o_rsrc[r / 2], (unsigned)o_voff, token_base * 4, 0);
+            store_out(res, r, (unsigned)o_voff, token_base);
         } else {
             const int abs_pos = token_base + jtok;
             const bool valid  = abs_pos >= sel_ks[r / 2] && abs_pos < sel_ke[r / 2];
@@ -294,7 +310,7 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
             else { val = res; }
             const bool do_write = CLEAN_LOGITS ? write : (write && valid);
             const unsigned voff = do_write ? (unsigned)o_voff : OOB_VOFF;
-            __builtin_amdgcn_raw_buffer_store_b32(__builtin_bit_cast(unsigned, val), o_rsrc[r / 2], voff, token_base * 4, 0);
+            store_out(val, r, voff, token_base);
         }
     };
     auto pair_store = [&](int r, float p0, float p1, float scale, int token_base, auto masked_c, auto nops_c) {
@@ -349,7 +365,7 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
     // previous sub-tile, stored during the next one: P0/P1 = rows 0/1 after the permlane, p2 and (e3, o3) of rows 2/3
     float pd_P0 = 0.f, pd_P1 = 0.f, pd_p2 = 0.f, pd_e3 = 0.f, pd_o3 = 0.f;
     int pd_tok = 0;
-    auto dummy_store = [&]() { __builtin_amdgcn_raw_buffer_store_b32(0u, o_rsrc[0], OOB_VOFF, 0, 0); };
+    auto dummy_store = [&]() { store_out(0.f, 0, OOB_VOFF, 0); };
 #define FLUSH_PEND() { pair_finish(0, pd_P0, pd_P1, Bo[1].scale, pd_tok, MK{}); \
                        pair_store(2, pd_p2, pd_e3 + pd_o3, Bo[1].scale, pd_tok, MK{}, IC<2>{}); }
     // prologue: stages t..t+PF-1 in register slots; stage t -> LDS stage 0; row 0 of sub-tile 0 -> acc[0]
@@ -559,24 +575,45 @@ void choose_grid(int M, int N, int total_cu, int& split, int& rev) {
     cache[key] = {split, rev};
 }
 
+template <bool HI16>
 void dispatch_fp8_mqa_logits(const fp8* Q, const fp8* K, const float* scale, const float* w, const int* ks,
-                             const int* ke, float* out, int M, int N, int split_n, int num_warps, bool clean,
+                             const int* ke, void* out, int M, int N, int split_n, int num_warps, bool clean,
                              bool rev, hipStream_t stream) {
     const int row_blocks = CDIV_(M, 4 * num_warps);
     dim3 grid(row_blocks, split_n);
 #define L(NW, CL, RV) \
-    mqa_v35wes::kernel<NW, 2, 4, CL, RV><<<grid, NW * WARP_SIZE, 0, stream>>>(Q, K, scale, w, ks, ke, out, M, N, split_n)
+    mqa_v35wes::kernel<NW, 2, 4, CL, RV, HI16><<<grid, NW * WARP_SIZE, 0, stream>>>(Q, K, scale, w, ks, ke, out, M, N, split_n)
 #define LC(NW) \
     if (clean) { if (rev) L(NW, true, true); else L(NW, true, false); } \
     else       { if (rev) L(NW, false, true); else L(NW, false, false); }
-    if (num_warps == 8) { LC(8); } else { LC(4); }
+    if constexpr (HI16) { if (rev) L(8, false, true); else L(8, false, false); }
+    else if (num_warps == 8) { LC(8); } else { LC(4); }
 #undef LC
 #undef L
+}
+
+void check_inputs(const torch::Tensor& q_fp8, const torch::Tensor& k_fp8, const torch::Tensor& kv_scale,
+                  const torch::Tensor& weights, const torch::Tensor& cu_seqlen_ks, const torch::Tensor& cu_seqlen_ke) {
+    const int64_t M = q_fp8.size(0), N = k_fp8.size(0);
+    TORCH_CHECK(q_fp8.dim() == 3 && q_fp8.size(1) == NUM_HEADS && q_fp8.size(2) == HEAD_SIZE,
+                "Only n_heads=32, head_dim=128 supported");
+    TORCH_CHECK(k_fp8.dim() == 2 && k_fp8.size(1) == HEAD_SIZE, "K must be [N, 128]");
+    TORCH_CHECK(q_fp8.element_size() == 1 && k_fp8.element_size() == 1, "q_fp8 and k_fp8 must be fp8");
+    TORCH_CHECK(q_fp8.is_contiguous() && k_fp8.is_contiguous(), "q_fp8 and k_fp8 must be contiguous");
+    TORCH_CHECK(kv_scale.scalar_type() == torch::kFloat32 && kv_scale.is_contiguous() && kv_scale.numel() == N,
+                "kv_scale must be a contiguous f32 [N] tensor");
+    TORCH_CHECK(weights.scalar_type() == torch::kFloat32 && weights.is_contiguous() &&
+                    weights.numel() == M * NUM_HEADS,
+                "weights must be a contiguous f32 [M, 32] tensor");
+    TORCH_CHECK(cu_seqlen_ks.scalar_type() == torch::kInt32 && cu_seqlen_ke.scalar_type() == torch::kInt32 &&
+                    cu_seqlen_ks.is_contiguous() && cu_seqlen_ke.is_contiguous() &&
+                    cu_seqlen_ks.numel() == M && cu_seqlen_ke.numel() == M,
+                "cu_seqlen_ks/ke must be contiguous int32 [M] tensors");
 }
 }  // namespace
 
 // ============================================================================
-// Torch-facing entry point
+// Torch-facing entry points
 // ============================================================================
 torch::Tensor fp8_mqa_logits(
     torch::Tensor q_fp8,        // [M, 32, 128] fp8
@@ -597,20 +634,7 @@ torch::Tensor fp8_mqa_logits(
     const int M = q_fp8.size(0);
     const int N = k_fp8.size(0);
 
-    TORCH_CHECK(q_fp8.dim() == 3 && q_fp8.size(1) == NUM_HEADS && q_fp8.size(2) == HEAD_SIZE,
-                "Only n_heads=32, head_dim=128 supported");
-    TORCH_CHECK(k_fp8.dim() == 2 && k_fp8.size(1) == HEAD_SIZE, "K must be [N, 128]");
-    TORCH_CHECK(q_fp8.element_size() == 1 && k_fp8.element_size() == 1, "q_fp8 and k_fp8 must be fp8");
-    TORCH_CHECK(q_fp8.is_contiguous() && k_fp8.is_contiguous(), "q_fp8 and k_fp8 must be contiguous");
-    TORCH_CHECK(kv_scale.scalar_type() == torch::kFloat32 && kv_scale.is_contiguous() && kv_scale.numel() == N,
-                "kv_scale must be a contiguous f32 [N] tensor");
-    TORCH_CHECK(weights.scalar_type() == torch::kFloat32 && weights.is_contiguous() &&
-                    weights.numel() == (int64_t)M * NUM_HEADS,
-                "weights must be a contiguous f32 [M, 32] tensor");
-    TORCH_CHECK(cu_seqlen_ks.scalar_type() == torch::kInt32 && cu_seqlen_ke.scalar_type() == torch::kInt32 &&
-                    cu_seqlen_ks.is_contiguous() && cu_seqlen_ke.is_contiguous() &&
-                    cu_seqlen_ks.numel() == M && cu_seqlen_ke.numel() == M,
-                "cu_seqlen_ks/ke must be contiguous int32 [M] tensors");
+    check_inputs(q_fp8, k_fp8, kv_scale, weights, cu_seqlen_ks, cu_seqlen_ke);
     // Rows per wave are fixed at 4 (32 per workgroup); BlockM is kept for drop-in compatibility only.
     TORCH_CHECK(BlockM == 0 || BlockM == 4, "BlockM must be 0 (default) or 4, got ", BlockM);
     (void)Unroll2;   // no unroll variant: the stage loop is always unrolled x4 over the LDS/prefetch ring
@@ -644,9 +668,49 @@ torch::Tensor fp8_mqa_logits(
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(out_logits));
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
-    dispatch_fp8_mqa_logits(static_cast<const fp8*>(q_fp8.data_ptr()), static_cast<const fp8*>(k_fp8.data_ptr()),
-                            kv_scale.data_ptr<float>(), weights.data_ptr<float>(), cu_seqlen_ks.data_ptr<int>(),
-                            cu_seqlen_ke.data_ptr<int>(), out_logits.data_ptr<float>(), M, N, split_n, num_warps_,
-                            clean_logits, rev > 0, stream);
+    dispatch_fp8_mqa_logits<false>(static_cast<const fp8*>(q_fp8.data_ptr()), static_cast<const fp8*>(k_fp8.data_ptr()),
+                                   kv_scale.data_ptr<float>(), weights.data_ptr<float>(), cu_seqlen_ks.data_ptr<int>(),
+                                   cu_seqlen_ke.data_ptr<int>(), out_logits.data_ptr<float>(), M, N, split_n, num_warps_,
+                                   clean_logits, rev > 0, stream);
     return out_logits;
+}
+
+torch::Tensor fp8_mqa_logits_topk(
+    torch::Tensor q_fp8,
+    torch::Tensor k_fp8,
+    torch::Tensor kv_scale,
+    torch::Tensor weights,
+    torch::Tensor cu_seqlen_ks,
+    torch::Tensor cu_seqlen_ke,
+    torch::Tensor topk_indices, // [M, K] int32
+    int64_t TotalCuCount)
+{
+    const int M = q_fp8.size(0);
+    const int N = k_fp8.size(0);
+    check_inputs(q_fp8, k_fp8, kv_scale, weights, cu_seqlen_ks, cu_seqlen_ke);
+    TORCH_CHECK(topk_indices.scalar_type() == torch::kInt32 && topk_indices.is_contiguous() &&
+                    topk_indices.dim() == 2 && topk_indices.size(0) == M,
+                "topk_indices must be a contiguous int32 [M, K] tensor");
+    const int K = topk_indices.size(1);
+    TORCH_CHECK(K >= 1 && K <= TOPK_HI16_MAX_K, "top-k must be in [1, ", TOPK_HI16_MAX_K, "], got ", K);
+    if (M == 0) return topk_indices;
+    if (N == 0) return topk_indices.fill_(-1);
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(topk_indices));
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    int split_n, rev;
+    choose_grid(M, N, static_cast<int>(TotalCuCount), split_n, rev);
+    // Scratch from the caching allocator: the 16-bit logits, then the top-k's candidate lists.
+    const auto opts = torch::dtype(torch::kInt32).device(q_fp8.device());
+    torch::Tensor logits16 = torch::empty({M, N}, torch::dtype(torch::kBFloat16).device(q_fp8.device()));
+    torch::Tensor ws = torch::empty({topk_hi16_workspace_ints(M, N)}, opts);
+    dispatch_fp8_mqa_logits<true>(static_cast<const fp8*>(q_fp8.data_ptr()), static_cast<const fp8*>(k_fp8.data_ptr()),
+                                  kv_scale.data_ptr<float>(), weights.data_ptr<float>(), cu_seqlen_ks.data_ptr<int>(),
+                                  cu_seqlen_ke.data_ptr<int>(), logits16.data_ptr(), M, N, split_n, 8, false,
+                                  rev > 0, stream);
+    const int err = launch_topk_hi16(logits16.data_ptr(), cu_seqlen_ks.data_ptr<int>(), cu_seqlen_ke.data_ptr<int>(),
+                                     topk_indices.data_ptr<int>(), M, N, K, q_fp8.data_ptr(), k_fp8.data_ptr(),
+                                     kv_scale.data_ptr<float>(), weights.data_ptr<float>(), ws.data_ptr<int>(), stream);
+    TORCH_CHECK(err == 0, "top-k launch failed: ", err);
+    return topk_indices;
 }

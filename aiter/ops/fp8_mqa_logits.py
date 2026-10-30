@@ -69,3 +69,26 @@ def fp8_mqa_logits(
     outside each row's window the kernel writes -inf when clean_logits, and leaves
     the buffer untouched otherwise.
     """
+
+
+@compile_ops(MD_NAME, fc_name="fp8_mqa_logits_topk")
+def fp8_mqa_logits_topk(
+    q_fp8: Tensor,
+    k_fp8: Tensor,
+    kv_scale: Tensor,
+    weights: Tensor,
+    cu_seqlen_ks: Tensor,
+    cu_seqlen_ke: Tensor,
+    topk_indices: Tensor,
+    TotalCuCount: int = 256,
+) -> Tensor:
+    """fp8_mqa_logits + a per-row top-K in one call that never writes fp32 logits.
+
+    topk_indices [M, K] i32, K <= 512, written in place (and returned): row m gets the
+    indices, relative to ks[m], of its K largest logits in [ks[m], ke[m]) in no
+    particular order, or 0..len-1 then -1 when the row has len <= K -- the contract of
+    vLLM's top_k_per_row_prefill. The logits kernel stores only the high 16 bits of
+    each logit; the elements tied with the K-th 16-bit key get their fp32 logit
+    recomputed with the same MFMA and epilogue (same bits), so the selection equals
+    a top-K of fp8_mqa_logits' fp32 output up to exact fp32 ties.
+    """

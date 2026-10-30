@@ -42,3 +42,22 @@ torch::Tensor fp8_mqa_logits(torch::Tensor q_fp8,        // [M, 32, 128] fp8
                              int64_t Unroll2,     // ignored (API compatibility)
                              int64_t ReverseRows, // -1 = host heuristic, 0/1 = off/on
                              std::optional<torch::Tensor> out);
+
+// fp8_mqa_logits + top-K per row (K <= 512) without fp32 logits: 16-bit keys, exact fp32 only for the
+// elements tied with the K-th key. Output as vLLM's top_k_per_row_prefill: indices relative to ks
+// (unordered), or 0..len-1 then -1 for a row of len <= K.
+torch::Tensor fp8_mqa_logits_topk(torch::Tensor q_fp8,
+                                  torch::Tensor k_fp8,
+                                  torch::Tensor kv_scale,
+                                  torch::Tensor weights,
+                                  torch::Tensor cu_seqlen_ks,
+                                  torch::Tensor cu_seqlen_ke,
+                                  torch::Tensor topk_indices, // [M, K] i32, written in place
+                                  int64_t TotalCuCount);
+
+// fp8_mqa_logits_topk.cu
+constexpr int TOPK_HI16_MAX_K = 512;
+int64_t topk_hi16_workspace_ints(int M, int N); // scratch for launch_topk_hi16
+int launch_topk_hi16(const void* logits16, const int* ks, const int* ke, int* out, int M, int N, int K,
+                     const void* q, const void* k, const float* kv_scale, const float* w, int* ws,
+                     hipStream_t s);

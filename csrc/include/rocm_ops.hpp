@@ -2927,4 +2927,14 @@ namespace py = pybind11;
           py::arg("clean_logits") = true,              \
           py::arg("unroll2")      = -1,                \
           py::arg("reverse_rows") = -1,                \
-          py::arg("out")          = std::nullopt);
+          py::arg("out")          = std::nullopt);     \
+    m.def("fp8_mqa_logits_topk",                       \
+          &fp8_mqa_logits_topk,                        \
+          py::arg("q_fp8"),                            \
+          py::arg("k_fp8"),                            \
+          py::arg("kv_scale"),                         \
+          py::arg("weights"),                          \
+          py::arg("cu_seqlen_ks"),                     \
+          py::arg("cu_seqlen_ke"),                     \
+          py::arg("topk_indices"),                     \
+          py::arg("TotalCuCount") = 256);
