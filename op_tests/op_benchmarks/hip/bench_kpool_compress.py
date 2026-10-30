@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -18,6 +17,7 @@ the compulsory bytes only: 512 B read + 33 B written per prefill token
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 from pathlib import Path
 
@@ -69,7 +69,9 @@ def make_decode(B, next_n, pool, page, seed=0):
 
 
 def bench(fn, warmup=5, rep=50):
-    ms, p20, p80 = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.2, 0.8])
+    ms, p20, p80 = triton.testing.do_bench(
+        fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.2, 0.8]
+    )
     return ms * 1e3, p20 * 1e3, p80 * 1e3
 
 
@@ -80,7 +82,19 @@ def run_insert(args):
     for n in args.insert_tokens:
         k, gate, ape, slot, kv = make_prefill(n, args.pool, args.page)
         lanes = args.lanes or kpool_pick_lanes(n, args.pool)
-        us, p20, p80 = bench(lambda: aiter.kpool_compress_insert(kv, k, gate, ape, slot, args.pool, True, lanes))
+        us, p20, p80 = bench(
+            functools.partial(
+                aiter.kpool_compress_insert,
+                kv,
+                k,
+                gate,
+                ape,
+                slot,
+                args.pool,
+                True,
+                lanes,
+            )
+        )
         tbs = n * (2 * HEAD_DIM * 2 + 33) / us / 1e6
         print(f"{n:>9} {lanes:>5} {us:9.2f} {p20:9.2f} {p80:9.2f} {tbs:6.2f}")
         rows.append(("insert", n, 0, 0, lanes, us, p20, p80, tbs))
@@ -95,8 +109,23 @@ def run_decode(args):
     print(f"{'B':>6} {'next_n':>6} {'us':>9} {'p20':>9} {'p80':>9} {'TB/s':>6}")
     for B in args.decode_batch:
         for next_n in args.decode_next_n:
-            kv, tail, tail_slot, key, score, ape, slot_map, pos = make_decode(B, next_n, args.pool, args.page)
-            us, p20, p80 = bench(lambda: aiter.kpool_decode_update(kv, tail, tail_slot, key, score, ape, slot_map, pos, args.pool))
+            kv, tail, tail_slot, key, score, ape, slot_map, pos = make_decode(
+                B, next_n, args.pool, args.page
+            )
+            us, p20, p80 = bench(
+                functools.partial(
+                    aiter.kpool_decode_update,
+                    kv,
+                    tail,
+                    tail_slot,
+                    key,
+                    score,
+                    ape,
+                    slot_map,
+                    pos,
+                    args.pool,
+                )
+            )
             closes = int((slot_map >= 0).sum())
             nbytes = B * next_n * 1024 + closes * (1536 + 132)
             tbs = nbytes / us / 1e6
@@ -107,22 +136,66 @@ def run_decode(args):
 
 def run_mixed(args):
     rows = []
-    print(f"\nmixed (pool {args.pool}, page {args.page}): prefill tokens + decode requests in one launch")
+    print(
+        f"\nmixed (pool {args.pool}, page {args.page}): prefill tokens + decode requests in one launch"
+    )
     print(f"{'tokens':>9} {'B':>6} {'next_n':>6} {'us':>9} {'p20':>9} {'p80':>9}")
     for n in args.mixed_tokens:
         for B in args.mixed_batch:
             next_n = args.decode_next_n[0]
-            kv_d, tail, tail_slot, key, score, ape, slot_map, pos = make_decode(B, next_n, args.pool, args.page)
+            kv_d, tail, tail_slot, key, score, ape, slot_map, pos = make_decode(
+                B, next_n, args.pool, args.page
+            )
             k, gate, _, slot, kv_p = make_prefill(n, args.pool, args.page, seed=1)
             slot = torch.where(slot >= 0, slot + kv_d.shape[0] * args.page, slot)
             kv = torch.cat([kv_d, kv_p], 0)
-            tslot = (torch.full((n,), B, dtype=torch.int32, device=DEVICE) * args.pool
-                     + torch.arange(n, device=DEVICE, dtype=torch.int32) % args.pool)
-            tail = torch.cat([tail, torch.zeros(1, 2, args.pool, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE)], 0)
-            us, p20, p80 = bench(lambda: aiter.kpool_mixed_write(
-                kv, ape, args.pool, True, 0, k, gate, slot, tslot, tail, tail_slot, key, score, slot_map, pos))
+            tslot = (
+                torch.full((n,), B, dtype=torch.int32, device=DEVICE) * args.pool
+                + torch.arange(n, device=DEVICE, dtype=torch.int32) % args.pool
+            )
+            tail = torch.cat(
+                [
+                    tail,
+                    torch.zeros(
+                        1, 2, args.pool, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE
+                    ),
+                ],
+                0,
+            )
+            us, p20, p80 = bench(
+                functools.partial(
+                    aiter.kpool_mixed_write,
+                    kv,
+                    ape,
+                    args.pool,
+                    True,
+                    0,
+                    k,
+                    gate,
+                    slot,
+                    tslot,
+                    tail,
+                    tail_slot,
+                    key,
+                    score,
+                    slot_map,
+                    pos,
+                )
+            )
             print(f"{n:>9} {B:>6} {next_n:>6} {us:9.2f} {p20:9.2f} {p80:9.2f}")
-            rows.append(("mixed", n, B, next_n, kpool_pick_lanes(n, args.pool), us, p20, p80, 0.0))
+            rows.append(
+                (
+                    "mixed",
+                    n,
+                    B,
+                    next_n,
+                    kpool_pick_lanes(n, args.pool),
+                    us,
+                    p20,
+                    p80,
+                    0.0,
+                )
+            )
             del kv, tail, k, gate
             torch.cuda.empty_cache()
     return rows
@@ -133,7 +206,12 @@ def main():
     p.add_argument("--only", choices=["insert", "decode", "mixed"], default=None)
     p.add_argument("--pool", type=int, default=4)
     p.add_argument("--page", type=int, default=64)
-    p.add_argument("--lanes", type=int, default=0, help="force lanes per pool for insert (16/32/64)")
+    p.add_argument(
+        "--lanes",
+        type=int,
+        default=0,
+        help="force lanes per pool for insert (16/32/64)",
+    )
     p.add_argument("--insert-tokens", type=int, nargs="*", default=INSERT_TOKENS)
     p.add_argument("--decode-batch", type=int, nargs="*", default=DECODE_BATCH)
     p.add_argument("--decode-next-n", type=int, nargs="*", default=DECODE_NEXT_N)
@@ -154,7 +232,19 @@ def main():
 
         with Path(args.o).open("w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["op", "tokens", "batch", "next_n", "lanes", "us", "p20_us", "p80_us", "TB_s"])
+            w.writerow(
+                [
+                    "op",
+                    "tokens",
+                    "batch",
+                    "next_n",
+                    "lanes",
+                    "us",
+                    "p20_us",
+                    "p80_us",
+                    "TB_s",
+                ]
+            )
             w.writerows(rows)
         print(f"\nsaved {len(rows)} rows to {args.o}")
 
