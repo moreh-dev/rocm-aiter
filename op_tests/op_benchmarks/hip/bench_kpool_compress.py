@@ -149,15 +149,20 @@ def run_mixed(args):
             k, gate, _, slot, kv_p = make_prefill(n, args.pool, args.page, seed=1)
             slot = torch.where(slot >= 0, slot + kv_d.shape[0] * args.page, slot)
             kv = torch.cat([kv_d, kv_p], 0)
+            # the prefill rows seed tail block B; every index tensor of one launch shares the prefill slot dtype
+            ring = tail.shape[2]
             tslot = (
-                torch.full((n,), B, dtype=torch.int32, device=DEVICE) * args.pool
-                + torch.arange(n, device=DEVICE, dtype=torch.int32) % args.pool
+                torch.full((n,), B, dtype=slot.dtype, device=DEVICE) * ring
+                + torch.arange(n, device=DEVICE, dtype=slot.dtype) % ring
+            )
+            tail_slot, slot_map, pos = (
+                t.to(slot.dtype) for t in (tail_slot, slot_map, pos)
             )
             tail = torch.cat(
                 [
                     tail,
                     torch.zeros(
-                        1, 2, args.pool, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE
+                        1, 2, ring, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE
                     ),
                 ],
                 0,
