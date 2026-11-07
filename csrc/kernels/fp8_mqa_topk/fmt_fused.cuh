@@ -60,7 +60,7 @@ constexpr int FUSED_THREADS = 512;
 #define FMT_SPIN_SLEEP 2
 #endif
 #ifndef FMT_FUSED_SEL_RC
-#define FMT_FUSED_SEL_RC 48   // in-kernel select: candidates held in registers (rest through the radix path)
+#define FMT_FUSED_SEL_RC 32   // in-kernel select: candidates held in registers (rest through the radix path); 48 spills (316 -> 644 B scratch, step 3 +30 %)
 #endif
 
 // In-kernel select of one row behind a call boundary: its register arrays then do not add to the scan's register

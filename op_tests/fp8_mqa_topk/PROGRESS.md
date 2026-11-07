@@ -123,3 +123,115 @@ Applied:
 
 ISL 128K (ms, `results/bench_ev4_128k.json`): baseu 10.936 | hi16u 8.994 | **step 0 (S32) 8.554 (-21.8 %)** |
 step 1 (S32) 8.629 (-21.1 %).
+
+## 2026-11-07 - steps 2-4: fused kernel, in-kernel select, persistent single launch
+
+Code: `fmt_fused.cuh` (`fused_kernel<FUSE_SELECT, PERSIST, REVERSE_ROWS>`, one item body for all three steps),
+launchers `fmt_step2/3/4` in `fp8_mqa_topk_capi.cu`, drivers `fmt_steps.Step2/3/4`. All use PF 2 and S = 32.
+
+| step | launches | kernels |
+|---|---|---|
+| 2 | 3 | fused (sample + tau + EMIT) -> `select_kernel<32>` -> `fallback1_kernel` |
+| 3 | 2 | fused + in-kernel select (last split of each row block) -> `fallback1_kernel` |
+| 4 | 1 | persistent fused: claim loop -> global barrier -> in-kernel fallback drain -> last WG resets counters |
+
+* **Row-wide tau inside the scan kernel.** Split 0 of each row block runs the sample pass through the SAME EV4
+  emission pipeline (runtime key stride `kvm = S`, records `fp32 | idx << 32` into `smp`), computes tau per row
+  (`wave_tau_ld`) and publishes it with a release store of the launch epoch into `tau_ready[bx]`; the other splits
+  poll it and acquire. Split-0 work items are dispatched (grid) or claimed (persistent) before any split 1, so the
+  wait cannot deadlock. The first version used per-split taus (each split targets the full K: SplitN x ~1.4K
+  candidates per row; LDS survivor compaction made it worse) and was replaced.
+* tau = -inf only when nvalid <= K (steps 0/1: nvalid <= CAP). Part of step 2's lead at 16384 x 4096 comes from this
+  rule: steps 0/1 emit every key of a row with <= 4096 valid keys.
+* Step 3: after its EMIT pipelines each WG does vmcnt(0) -> barrier -> acq_rel `block_done[bx]` (self-resetting);
+  the last split selects the block's 32 rows (`fused_select_row`, a `__noinline__` call, 32 candidate registers per
+  lane, radix path beyond). Failing rows go to the fallback list.
+* Step 4: grid = min(256, items). Items are claimed with a relaxed atomic, split-major, heaviest row blocks first.
+  The item body sits behind a `__noinline__` call: inlined, the persistent loop spilled inside the pipelines. A
+  global barrier is followed by the in-kernel fallback drain (8 waves recompute a row into a per-WG scratch row, then
+  `wave_select_dense`); the last WG out resets the counters and the fallback count. Per-WG sample slots.
+
+Bugs found on the way (all fixed, all tests exact):
+1. **GPU memory fault in step 2:** an inline-asm `buffer_load` directly after a `v_readlane` (SGPR spill reload)
+   needs 5 wait states, and the hazard recognizer does not see inside inline asm. Found with rocgdb (`set amdgpu
+   precise-memory on`). Fix: `s_nop 4` inside the asm string; `tools/sgprhaz.py` checks the ISA (0 violations).
+2. Relative radix select returned wrong rows when a pass's bits overlapped the fixed prefix: it now tracks
+   `top`/`sh` explicitly.
+3. The `__noinline__` item body produced "invalid operand" in the asm loads: its scalar arguments arrive in VGPRs, so
+   they are now made uniform with `readfirstlane`.
+4. **Long context: tau over more than 2048 samples** took a radix path with one dependent global load per step.
+   Inside the 1-WG/CU kernel this took 251 us per block (576 x 250000 chunk: 2.88 ms vs 0.64 for step 0). Now every
+   lane keeps its 8 largest sample keys from batched loads, and the relative radix runs on the 512 kept keys. They
+   are a subset of the samples, so tau stays a lower bound of the target-th largest sample and exactness is
+   unchanged. A 2048-sample cap (adaptive stride) was tried first and rejected: tau got too coarse at N >= 196608
+   (up to 6074 candidates/row > CAP 4096, 33 / 841 fallback rows, 100-367 ms per chunk).
+5. **Spin-waits slowed the producer.** An ACQUIRE atomic load in the poll loop emits `buffer_inv sc1` on every poll.
+   With 13 x 18 WGs waiting on 18 split-0 WGs (576 x 250000) the producers ran 2-4x slower. Polls are now relaxed,
+   with one acquire fence after the WG barrier: sample 352 -> 175 us, tau 251 -> 66 us, kernel 1.18 -> 0.75 ms
+   (`ts_probe.py`, a `-DFMT_TS` build that timestamps each WG phase).
+6. 48 candidate registers in the in-kernel select (to keep 2-3K-candidate rows off the radix path) raised the call
+   frame from 316 to 644 B and made step 3 30 % slower on 16384 x 4096. Reverted to 32; the standalone select keeps a
+   48-register path (204 VGPR, 0 scratch).
+
+Gates on every build: `scratch` of the fused kernels only outside the hand-vmcnt pipeline regions
+(`tools/scratchloc.py`: inside 0), `tools/sgprhaz.py` 0 violations, `test_exact.py --quick` 16/16 for steps 0-4
+(random, multi-request, non-causal, odd windows, M % 32 != 0, SplitN up to 14, offset / ties / periodic /
+increasing, 1024 x 196608 increasing, forced fallback, poisoned workspaces), `repeat_check.py 2|3|4` (30 back-to-back
+launches over 3 alternating shapes: self-resetting counters and epochs).
+
+### Results (1 layer, top-512, ms; `results/bench_steps_128k_final.json`, 3 rounds)
+
+ISL 128,000 (8 chunks):
+
+| baseu | hi16u | fuse48 | step 0 | step 1 | **step 2** | step 3 | step 4 |
+|---|---|---|---|---|---|---|---|
+| 10.912 | 8.986 (-17.7 %) | 10.200 (-6.5 %) | 8.587 (-21.3 %) | 8.658 (-20.7 %) | **8.333 (-23.6 %)** | 8.563 (-21.5 %) | 9.450 (-13.4 %) |
+
+Per chunk, step 3 - step 2 = +15-45 us (+64 us on the 3-split 13312 x 32000 chunk); step 4 - step 3 = +77-165 us.
+0 wrong rows and 0 fallback rows on every chunk; ~1.4K candidates per row (max ~2.4K).
+
+Long context and small M (`results/bench_long_shapes_final.json`):
+
+| chunk (SplitN) | baseu | hi16u | step 0 | step 2 | step 3 | step 4 |
+|---|---|---|---|---|---|---|
+| 16384 x 65536 (1) | 4.856 | 4.132 | 3.656 | **3.631** | 3.647 | 3.921 |
+| 16384 x 262144 (1) | 19.073 | 18.270 | **14.137** | 14.358 | 14.336 | 15.295 |
+| 2048 x 131072 (4) | 1.339 | 1.156 | **0.974** | 1.041 | 1.096 | 1.209 |
+| 576 x 250000 (14) | 0.763 | 0.671 | **0.563** | 0.738 | 0.797 | 0.906 |
+
+### Why step 3 and step 4 are not faster (measured)
+
+* **Launches cost nothing here.** rocprofv3 shows ~0 us between back-to-back kernels of one pipeline, so fusing a
+  launch only pays if the work it moves gets cheaper. On gfx950 it gets more expensive.
+* **The in-kernel select is slower than its own kernel.** The fused kernel needs all 256 VGPRs (1 WG/CU), so the
+  select cannot be inlined (that spilled inside the hand-vmcnt pipelines, which gives wrong results, see step 0). Behind
+  a call it pays the call frame (316 B/lane scratch) and runs on the 4 rows of each wave in turn. Probe: 61-69 us per
+  32-row block at every N, i.e. 122-138 us per CU per chunk. The standalone `select_kernel<32>` (204 VGPR, no
+  frame) does the same rows in less time: step 3 - step 2 = +15-45 us per 16384-row chunk. At 16384 x 4096 the in-kernel select (61 us) costs more than the block's whole
+  EMIT scan (55 us).
+* **Persistence has nothing to win and costs per item.**
+  * Static dispatch with the makespan model is already at the work/256 bound for full chunks.
+  * With 1 WG per CU, nothing overlaps inside a CU (PR 60618 does not overlap its select with the next scan either).
+  * Costs: the item body behind a call (callee-saved VGPR save/restore per item; 540 B scratch frame), the claims,
+    and the end barrier.
+  * PMC step 4 vs step 3: VALU 608 M -> 656 M, SALU 79 M -> 111 M, VMEM reads +4.8 %, wave cycles +24 %. The hot
+    loops are the same (19.0 vs 18.875 VALU/MFMA).
+* **Few row blocks, long rows (SplitN > 1):** split 0 samples the whole row (1/S of a full-row scan = SplitN/S of a
+  split's work) and computes tau while the other splits wait. At 576 x 250000 (14 splits) that is 175 + 66 us before
+  a 482 us EMIT, so step 2 is 0.738 vs 0.563 ms for step 0 (separate sample + tau kernels spread over all CUs). At
+  SplitN = 4 (2048 x 131072): +7 %; at SplitN <= 3: within 0-1 %.
+
+### Status vs the goal
+
+* Step 4 (one launch, exact) is implemented, but it is **not** faster. 9.45 ms at 128K: -13.4 % vs baseu, behind
+  hi16u, step 0 and steps 1-3. The reasons are above, and none of them is a missing optimization of the persistent
+  loop.
+* **Best path: step 2** (3 launches), 8.33 ms at 128K: -23.6 % vs baseu, -7.3 % vs hi16u. It also wins at 64K pools.
+  Step 0 is 1.6 % faster at 262K pools and leads on small-M chunks (SplitN >= 4).
+* A single launch at step-3 speed is possible without persistence: the selecting WG recomputes its rare failing rows
+  itself. That only removes the free `fallback1` launch, so it was not built.
+* Open, not done:
+  1. Distributed sampling for SplitN > 1. Each split samples its own stage range into its own segment; chunks are
+     claimed with epoch-valued flags (work stealing, so nothing assumes co-residency); the last finisher computes
+     tau. Expected: 576 x 250000 0.74 -> ~0.52 ms.
+  2. A faster in-kernel select (2 rows per wave in flight, no call frame) is the only lever left for step 3/4.

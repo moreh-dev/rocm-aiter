@@ -59,11 +59,10 @@ segment overflowed and the emitted set of a row contains >= K keys that all lie 
 largest logit of the row is >= that threshold, so the top-K is a subset of the candidates. The select then works on
 the exact fp32 candidate values.
 
-* Row-wide tau (steps 0-1): C = sum over splits of counts; require no overflow and C >= min(K, nvalid).
-* Per-split tau_s (steps 2-4, each split samples only its own key range): every split targets the FULL K inside its
-  own range (tau_s <= K-th largest of the split w.h.p.). Require, for every split s: no overflow and
-  cnt_s >= min(K, nvalid_s). Then every top-K key of the row (which is also >= the K-th of its own split) is a
-  candidate. Robust to splits with skewed score distributions; costs up to SplitN x ~1.1K candidates per row.
+* Row-wide tau (all steps): C = sum over splits of counts; require no overflow and C >= min(K, nvalid).
+* (Planned per-split tau_s for steps 2-4 - every split targets the full K inside its own range - was built and
+  dropped: SplitN x ~1.4K candidates per row made the select slower than the serialized row-wide sample. Steps 2-4
+  use row-wide tau: split 0 samples the whole row range and publishes tau, see PROGRESS.md.)
 
 ## 3. Threshold (tau) from a sample
 
@@ -71,12 +70,13 @@ Sample = keys n = j*S (j integer) inside the range being covered. For a row with
 samples: e = K * ns / nvalid (expected samples above the K-th value), target = ceil(e + 5*sqrt(e)) + 8,
 tau = the target-th largest SAMPLE logit (exact fp32 value; Nam used the lower edge of a 16-bit bucket - we keep full
 fp32 samples, so there is no bucket rounding and no "large common offset" precision problem).
-tau = -inf when nvalid <= CAP or ns < target (every valid key is a candidate). Expected candidates ~ target * S
-(~1.1K at S = 16, K = 512). P(fewer than K keys >= tau) is a > 5 sigma event per row.
+tau = -inf when ns < target, or nvalid <= CAP (steps 0/1) / nvalid <= K (steps 2-4). Expected candidates ~ target * S
+(~1.4K at S = 32, K = 512, e ~ 16, target ~ 44, independent of N). P(fewer than K keys >= tau) is a > 5 sigma event
+per row.
 
-S: 16 by default; per (row block, split) the sample count is capped at NS_MAX (4096) by raising S
-(S = max(16, ceil(range / NS_MAX)), power of two not required). At N ~ 250K (1M tokens): S = 64, e = 8, target = 30,
-~1.9K candidates.
+S = 32 for every fused variant (as implemented; S = 16 costs more sample + tau than it saves in candidates). The sample
+count is NOT capped: a 2048-sample cap made tau too coarse at N >= 196608 (up to 6K candidates/row > CAP). Rows with
+more than 2048 samples use a per-lane top-8 filter before the radix (section 4.2).
 
 ## 4. Kernels
 
@@ -104,8 +104,10 @@ Modes (compile-time):
 
 ### 4.2 tau / select / fallback (port of fuse48.hip, 32-bit keys)
 
-* tau: one wave per row; samples in registers (32 x 64 = 2048) -> bitwise binary search over order-preserving 32-bit
-  keys; more samples -> 4 x 8-bit radix with a 256-bin per-wave LDS histogram, re-reading global.
+* tau: one wave per row; samples in registers (up to 32 x 64 = 2048) -> relative two-pass radix (8-bit LDS histogram
+  just below the common prefix of the row's min/max key, then 8 more bits). More samples: each lane keeps its 8
+  largest keys (batched loads, branch-free insertion) and the same radix runs on the 512 kept keys - a subset of the
+  samples, so the result is still a lower bound of the target-th largest sample.
 * select: one wave per row; read counts of all splits, flag the row (append to the fallback list) if any check of
   section 2 fails; else exact top-K of the fp32 candidates (<= 2048 in registers: binary search; else radix), emit
   keys > T then ties == T up to K, positions by ballot/mbcnt. Output n - ks, -1 padding.
@@ -114,10 +116,11 @@ Modes (compile-time):
   chains `ae = ye*w0; ae = fma(ye, w_v, ae)`, `p = ae + ao`, permlane32 swap, `(p0 + p1) * scale`) into a scratch row,
   then radix select. NOTE fuse48's recompute32 mirrors v35/v35a (scaled MFMA with 2^-25, v_pk_mul clamp) and is NOT
   bit-exact with v35wes.
-* Memory model for reads of data written by the same kernel: use glc/sc0 loads (bypass the non-coherent vector L1).
-  Cross-workgroup hand-offs (split completion, fallback slices): release/acquire atomics at agent scope
-  (`__hip_atomic_fetch_add(p, 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT)`), since splits of one row block can run
-  on different XCDs whose L2s are not coherent.
+* Memory model (as implemented): an agent-scope release does NOT wait for inline-asm stores, so every hand-off is
+  `s_waitcnt vmcnt(0)` in every wave -> WG barrier -> one agent-scope atomic by one lane (acq_rel counter, or release
+  store of the launch epoch) -> broadcast through LDS -> acquire fence in every reading wave. Spin-waits poll with
+  RELAXED agent-scope loads and acquire once after the barrier (an acquire load per poll emits `buffer_inv sc1` per
+  iteration and slowed the producers 2-4x). sc0 = workgroup scope, sc1 = agent scope.
 * Counters (fallback count, split-completion counters, persistent claim/done counters) live in a small int32
   workspace zeroed ONCE at allocation; whoever consumes a counter resets it to 0 for the next launch (no memset
   launches).
@@ -131,18 +134,21 @@ Modes (compile-time):
   tau[m]. ks_s = ceil(ks/S), ke_s = ceil(ke/S) computed in-kernel. Fallback = ONE kernel: the first FBR flagged rows
   are recomputed by all waves in parallel, a per-row completion counter (acq_rel, agent scope) lets the wave that
   finishes the last slice run the select; further rows one wave per row. -> 4 launches.
-* **Step 2**: EMIT kernel with FUSE_TAU: split ranges become CONTIGUOUS stage ranges (split s of a WG covers stages
-  [s*per, (s+1)*per) of its [0, num_tiles); inside that range the masked/clean sub-ranges run as up to 3 pipeline
-  segments). Prologue per WG: STRIDED DENSE pipeline over the split range writing fp32 samples to a scratch region,
-  then tau_s per row (section 3 per split), then the EMIT pipelines. -> 3 launches (main, select, fallback).
+* **Step 2** (as implemented, `fmt_fused.cuh`): split ranges are CONTIGUOUS stage ranges. Split 0 of a row block
+  runs the sample pass through the same EV4 emission pipeline (key stride S, records into `smp`) over the whole block
+  range, computes tau per row and publishes it (release store of the launch epoch in `tau_ready[bx]`); the other
+  splits poll and acquire. Then the masked and clean EMIT pipelines. -> 3 launches (fused, select, fallback1).
 * **Step 3**: FUSE_SELECT: after its EMIT pipelines a WG writes its counts; SplitN == 1 -> it selects its 32 rows
   directly (8 waves x 4 rows); SplitN > 1 -> release fence + atomic on block_done[b]; the last split acquires and
-  selects (reads all splits' segments, glc). Flagged rows -> fallback list -> fallback kernel. -> 2 launches.
+  selects (reads all splits' segments after the acquire). Flagged rows -> fallback list -> fallback kernel. -> 2
+  launches. The select is a `__noinline__` call (inlined it spilled into the pipelines).
 * **Step 4**: PERSISTENT: grid = min(items, #CUs) WGs (1 WG of 8 waves per CU at ~250 VGPR); items = (row block,
   split) ordered heaviest first (reverse block order for a causal chunk, splits of a block adjacent); a WG claims
   items from a global atomic counter (wave 0 lane 0, broadcast through LDS), runs load Q/W -> sample -> tau -> scan ->
   completion -> select of its block if last, and recomputes flagged rows itself (8 waves recompute a row into a
   per-WG scratch row, then select). The last WG to finish resets the claim/done counters. -> 1 launch.
+  As implemented: claims are split-major (every split 0 before any split 1, so the tau wait cannot deadlock), the
+  item body is a `__noinline__` call, and the fallback rows are drained after a global barrier.
 
 ## 5. Risks to watch (each must be measured, not assumed)
 
