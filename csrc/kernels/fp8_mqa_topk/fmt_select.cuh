@@ -287,13 +287,13 @@ __global__ __launch_bounds__(256) void tau_kernel(const float* __restrict__ ls, 
 }
 
 // ------------------------------------------------------------------------------------------------- select
-// One row: candidates of nsplit segments cand[((s * M + m) * SEG + i], counts cnt[s * M + m]. Returns false if the row
-// must go to the fallback (overflow, or fewer than min(K, nvalid) candidates).
+// One row: candidates i < cnt[s * M + m] of split s at cand[cand_index(s, m, i)]. Returns false if the row must go to
+// the fallback (overflow, or fewer than min(K, nvalid) candidates).
 template <int RC, bool COHERENT>
 __device__ __forceinline__ bool wave_select_row(const unsigned long long* __restrict__ cand, const int* __restrict__ cnt,
                                                 int nsplit, int CAP, int M, int m, int ks, int nvalid, int K,
                                                 int* __restrict__ orow, uint32_t* hist, int lane) {
-    const int SEG = CAP + 1;
+    const int Mp = M + (M & 1);
     if (nvalid <= 0) { for (int i = lane; i < K; i += WARP) orow[i] = -1; return true; }
     if constexpr (COHERENT) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     int c_l = cnt[(int64_t)min(lane, nsplit - 1) * M + m];
@@ -310,12 +310,12 @@ __device__ __forceinline__ bool wave_select_row(const unsigned long long* __rest
         int s = 0, base = 0;
         #pragma unroll
         for (int t = 0; t < 16; ++t) if (t < nsplit && i >= pe_s[t]) { s = t + 1; base = pe_s[t]; }
-        return ((int64_t)s * M + m) * SEG + (i - base);
+        return cand_index(s, m, i - base, Mp, CAP);
     };
     // unconditional loads of a clamped index (masked after): no exec branch + vmcnt(0) per load
     auto ldc = [&](int i) -> unsigned long long {
         const int ic = min(i, C - 1);
-        const int64_t o = nsplit == 1 ? (int64_t)m * SEG + ic : addr(ic);
+        const int64_t o = nsplit == 1 ? cand_index(0, m, ic, Mp, CAP) : addr(ic);
         return cand[o];
     };
     uint32_t rk[RC]; int rc[RC];

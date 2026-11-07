@@ -83,4 +83,10 @@ __device__ __forceinline__ int load_i32_coh(const int* p) {
     return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
+// candidate slot of row m, split s, index i: interleaved pair segments of 2*CAP u64 (rows 2p, 2p+1), Mp = M rounded
+// up to even. The scan writes this layout; every select reads it.
+__host__ __device__ __forceinline__ int64_t cand_index(int s, int m, int i, int Mp, int CAP) {
+    return ((int64_t)s * Mp + (m & ~1)) * CAP + 2 * (int64_t)i + (m & 1);
+}
+
 }  // namespace fmt

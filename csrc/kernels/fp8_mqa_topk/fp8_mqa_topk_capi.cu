@@ -134,4 +134,25 @@ int fmt_select1(const unsigned long long* cand, const int* cnt, int nsplit, int 
     return (int)hipGetLastError();
 }
 
+// experiment: PF = 2 variants of the DENSE / EMIT scans (VGPR headroom vs speed)
+int fmt_dense_pf2(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke, float* out,
+                  int M, int N, int out_cols, int split, int rev, hipStream_t st) {
+    if (M <= 0 || N <= 0) return 0;
+    resolve_grid(M, N, split, rev);
+    dim3 grid(FMT_CDIV(M, 32), split);
+    if (rev) scan_kernel<8, 2, 2, MODE_DENSE, true><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, out, out_cols, 1, nullptr, nullptr, nullptr, 0, nullptr, 0, nullptr);
+    else     scan_kernel<8, 2, 2, MODE_DENSE, false><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, out, out_cols, 1, nullptr, nullptr, nullptr, 0, nullptr, 0, nullptr);
+    return (int)hipGetLastError();
+}
+int fmt_emit_pf2(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke, const float* tau,
+                 unsigned long long* cand, int* cnt, int cap, int M, int N, int split, int rev, int* split_used, hipStream_t st) {
+    if (M <= 0 || N <= 0) return 0;
+    resolve_grid(M, N, split, rev);
+    if (split_used) *split_used = split;
+    dim3 grid(FMT_CDIV(M, 32), split);
+    if (rev) scan_kernel<8, 2, 2, MODE_EMIT, true><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, nullptr, 0, 1, tau, cand, cnt, cap, nullptr, 0, nullptr);
+    else     scan_kernel<8, 2, 2, MODE_EMIT, false><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, nullptr, 0, 1, tau, cand, cnt, cap, nullptr, 0, nullptr);
+    return (int)hipGetLastError();
+}
+
 }  // extern "C"

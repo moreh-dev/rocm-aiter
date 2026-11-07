@@ -48,20 +48,21 @@ def gate_emit_complete(M, N, kind="rand", reqs=1, causal=True, split=0):
     sp, rv = S.choice(M, Nt)
     sp = split or sp
     cap = Nt
-    cand = torch.full((sp * M * (cap + 1),), -1, dtype=torch.int64, device="cuda")
+    Mp = M + (M & 1)
+    cand = torch.full((sp * Mp * cap,), -1, dtype=torch.int64, device="cuda")
     cnt = torch.full((sp * M,), -1, dtype=torch.int32, device="cuda")
     tau = torch.full((M,), float("-inf"), device="cuda")
     r = L.fmt_emit(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), p(tau), p(cand), p(cnt), cap, M, Nt, sp, rv, None, F.stream())
     assert r == 0
     torch.cuda.synchronize()
-    cand = cand.view(sp, M, cap + 1)[:, :, :cap]
+    cand = cand.view(sp, Mp // 2, cap, 2)     # [split][pair][i][row parity]
     cnt = cnt.view(sp, M)
     bad = 0
     for m in range(M):
         cols, bits = [], []
         for s_ in range(sp):
             c = int(cnt[s_, m])
-            d = cand[s_, m, :c]
+            d = cand[s_, m // 2, :c, m & 1]
             cols.append((d >> 32).to(torch.int64)); bits.append((d & 0xFFFFFFFF).to(torch.int64))
         cols = torch.cat(cols); bits = torch.cat(bits)
         valid = torch.isfinite(lg[m]).nonzero().flatten()

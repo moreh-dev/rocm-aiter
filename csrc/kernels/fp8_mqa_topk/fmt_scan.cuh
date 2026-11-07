@@ -8,12 +8,12 @@
 //               j (K row j*S, runtime stride S): K / kv_scale loads use voffset (t*S)*128 + piece*16 /
 //               (tid*S)*4 and soffset token_base*S*{128,4}; row windows become [ceil(ks/S), ceil(ke/S)) clipped to
 //               Ns = ceil(N/S); the output row stride is `out_cols`.
-//   MODE_EMIT   candidate emission (Nam's v48 pair_store): a logit is a candidate when res >= tau[row]; candidates
-//               are appended to the row's segment cand[(split*M + m)*(cap+1) + pos] as (n << 32) | bits(res) with
-//               ballot/mbcnt positions and wave-uniform per-row counters. Exactly ONE buffer_store_dwordx2 per pair
-//               (non-candidate lanes -> out-of-range voffset, overflow -> dump slot cap), so the hand-placed vmcnt
-//               accounting of v35wes (2*SUB stores per stage) is unchanged. cnt[split*M + m] = candidates seen
-//               (may exceed cap = overflow).
+//   MODE_EMIT   candidate emission: a logit is a candidate when res >= tau[row]; candidate i of row m (split s) is
+//               the u64 (n << 32) | bits(res) at cand[cand_index(s, m, i)] (interleaved pair segments, 2*CAP slots
+//               per row pair), positions from ballot/mbcnt and wave-uniform per-row counters. Exactly ONE buffer
+//               store per pair (non-candidate lanes -> out-of-range offset; i >= CAP = overflow, dropped by the range
+//               check), so the hand-placed vmcnt accounting of v35wes (2*SUB stores per stage) is unchanged.
+//               cnt[split*M + m] = candidates seen (> CAP = overflow).
 //
 // Geometry, pipeline, epilogue and schedule are v35wes's: 8 waves x 4 rows = 32 rows per WG, 2-stage LDS ring of
 // 2 x 32 tokens, PF = 4 register prefetch slots, hand-placed vmcnt, scalar epilogue co-issued under the MFMAs,
@@ -22,9 +22,6 @@
 #pragma once
 #include "fmt_common.cuh"
 #include "fmt_select.cuh"
-#ifndef FMT_EMIT_V1
-#define FMT_EMIT_V1 0   // 1 = Nam's v48 emission (per-lane tau / window VGPRs)
-#endif
 
 namespace fmt {
 
@@ -149,24 +146,26 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     // ---- buffer resources ----
     const i32x4 k_v = raw_rsrc(K_ptr, N * HEAD_SIZE);
     const i32x4 s_v = raw_rsrc(kv_scale_ptr, N * 4);
-    // output: DENSE -> fp32 rows (stride out_cols); EMIT -> candidate segments of my row pairs (rows r, r+1
-    // adjacent, (CAP + 1) u64 slots each, slot CAP = overflow dump)
-    const int SEG = CAP + 1;
+    // output: DENSE -> fp32 rows (stride out_cols); EMIT -> the interleaved segment of each row pair (rows r, r+1 =
+    // m0 + r even): 2 * CAP u64 slots, row r at even slots, row r + 1 at odd slots (see cand_index()); a slot index
+    // >= 2 * CAP (row count >= CAP = overflow) is dropped by the buffer range check.
+    const int Mp = M + (M & 1);
     __amdgpu_buffer_rsrc_t o_rsrc[BLOCK_M / 2];
-    i32x4 c_rsrc[BLOCK_M / 2];
+    __amdgpu_buffer_rsrc_t c_rsrc[BLOCK_M / 2];
     #pragma unroll
     for (int r = 0; r < BLOCK_M; r += 2) {
-        const int row = __builtin_amdgcn_readfirstlane(min(m0 + r, M - 1));
         if constexpr (EMIT) {
-            c_rsrc[r / 2] = raw_rsrc(cand_ptr + ((int64_t)pid_split * M + row) * SEG, 2 * SEG * 8);
+            const int row = __builtin_amdgcn_readfirstlane(m0 + r);   // < Mp, even
+            c_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)(cand_ptr + ((int64_t)pid_split * Mp + row) * CAP), 0, 2 * CAP * 8, FMT_BUF_RSRC_WORD3);
             o_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)cand_ptr, 0, 0, FMT_BUF_RSRC_WORD3);  // dummy stores only
         } else {
+            const int row = __builtin_amdgcn_readfirstlane(min(m0 + r, M - 1));
             o_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)(out_ptr + (int64_t)row * out_cols), 0, 2 * out_cols * 4, FMT_BUF_RSRC_WORD3);
         }
     }
     const int o_voff = hset * out_cols * 4 + jtok * 4;
     (void)o_voff;
-    const unsigned c_hoff = hset * SEG * 8;
+    const int hmask = -hset;                     // EMIT: per-half position correction
     float tau_reg[BLOCK_M];
     int cnt_row[BLOCK_M] = {0, 0, 0, 0};   // wave-uniform
     if constexpr (EMIT) {
@@ -235,44 +234,31 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
         sel_ks[r / 2] = hset ? ks_reg[r + 1] : ks_reg[r];
         sel_ke[r / 2] = hset ? ke_reg[r + 1] : ke_reg[r];
         sel_ok[r / 2] = (m0 + r + hset < M);
-#if FMT_EMIT_V1
         if constexpr (EMIT) sel_tau[r / 2] = hset ? tau_reg[r + 1] : tau_reg[r];
-#endif
     }
     const unsigned OOB_VOFF = 0x7ffffff0u;   // beyond num_records -> store dropped by the range check
-    auto store64 = [&](unsigned long long d, unsigned voff, int r) {   // asm operands from a captured array
-        asm volatile("buffer_store_dwordx2 %0, %1, %2, 0 offen" :: "v"(d), "v"(voff), "s"(c_rsrc[r / 2]) : "memory");
-    };
     // pair_finish: everything after the permlane (p0 / p1 already swapped); pair_store = swap + finish
     auto pair_finish = [&](int r, float p0, float p1, float scale, int token_base, auto masked_c) {
         constexpr bool MASKED = decltype(masked_c)::value;
         const float res = (p0 + p1) * scale;
         if constexpr (EMIT) {
+            // Branch-free (every ?: operand is a named value; bool & instead of &&: clang turns ?: on expressions into
+            // exec branches that split the sched_barrier-pinned sub-tile and spill). Review variant "EV4":
+            // per-row SGPR counters, ONE full-wave mbcnt with a per-half correction, interleaved pair slots.
             const int abs_pos = token_base + jtok;
-#if FMT_EMIT_V1
             bool cand = res >= sel_tau[r / 2];
-            if constexpr (MASKED) cand = cand && sel_ok[r / 2] && abs_pos < NT && abs_pos >= sel_ks[r / 2] && abs_pos < sel_ke[r / 2];
+            if constexpr (MASKED) cand = cand & (sel_ok[r / 2] != 0) & (abs_pos < NT) & (abs_pos >= sel_ks[r / 2]) & (abs_pos < sel_ke[r / 2]);
             const uint64_t msk = __ballot(cand);
-#else
-            // wave-uniform per-row tau / window in SGPRs: two compares per condition, merged by halves in SALU
-            // (no per-lane select VGPRs; the masked path is rare so its extra compares do not matter)
-            constexpr uint64_t LO32 = 0x00000000FFFFFFFFull, HI32 = 0xFFFFFFFF00000000ull;
-            uint64_t msk = (__ballot(res >= tau_reg[r]) & LO32) | (__ballot(res >= tau_reg[r + 1]) & HI32);
-            if constexpr (MASKED) {
-                const uint64_t va = (m0 + r < M) ? (__ballot(abs_pos >= ks_reg[r] && abs_pos < min(ke_reg[r], NT)) & LO32) : 0ull;
-                const uint64_t vb = (m0 + r + 1 < M) ? (__ballot(abs_pos >= ks_reg[r + 1] && abs_pos < min(ke_reg[r + 1], NT)) & HI32) : 0ull;
-                msk &= va | vb;
-            }
-            const bool cand = (msk >> l) & 1ull;
-#endif
             const unsigned mlo = (unsigned)msk, mhi = (unsigned)(msk >> 32);
-            const int pos = hset ? cnt_row[r + 1] + (int)__builtin_amdgcn_mbcnt_hi(mhi, 0)
-                                 : cnt_row[r] + (int)__builtin_amdgcn_mbcnt_lo(mlo, 0);
+            const unsigned mb = __builtin_amdgcn_mbcnt_hi(mhi, __builtin_amdgcn_mbcnt_lo(mlo, 0u));
+            const int c0 = cnt_row[r], c1 = cnt_row[r + 1] - __builtin_popcount(mlo);   // SALU
+            const int base = c0 + ((c1 - c0) & hmask);
+            const unsigned vt = ((mb + (unsigned)base) * 2u + (unsigned)hset) << 3;
+            const unsigned voff = cand ? vt : 0x40800000u;                                // 4.0f: inline constant, out of range
             cnt_row[r] += __builtin_popcount(mlo);
             cnt_row[r + 1] += __builtin_popcount(mhi);
-            const unsigned voff = cand ? c_hoff + (unsigned)min(pos, CAP) * 8u : OOB_VOFF;
-            const unsigned long long d = ((unsigned long long)(unsigned)abs_pos << 32) | __builtin_bit_cast(unsigned, res);
-            store64(d, voff, r);
+            using u32x2 = __attribute__((__vector_size__(8))) unsigned int;
+            __builtin_amdgcn_raw_buffer_store_b64(u32x2{__builtin_bit_cast(unsigned, res), (unsigned)abs_pos}, c_rsrc[r / 2], voff, 0, 0);
         } else if constexpr (!MASKED) {
             __builtin_amdgcn_raw_buffer_store_b32(__builtin_bit_cast(unsigned, res), o_rsrc[r / 2], (unsigned)o_voff, token_base * 4, 0);
         } else {

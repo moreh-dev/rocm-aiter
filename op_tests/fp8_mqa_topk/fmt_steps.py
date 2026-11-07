@@ -67,7 +67,7 @@ class Step0:
         self.Ns = (N + self.S - 1) // self.S
         self.ls = torch.empty(M, self.Ns, device=d)
         self.tau = torch.empty(M, device=d)
-        self.cand = torch.empty(self.split * M * (self.cap + 1), dtype=torch.int64, device=d)
+        self.cand = torch.empty(self.split * (M + (M & 1)) * self.cap, dtype=torch.int64, device=d)
         self.cnt = torch.empty(self.split * M, dtype=torch.int32, device=d)
         self.flag = torch.empty(M, dtype=torch.int32, device=d)
         self.fbc = torch.zeros(1, dtype=torch.int32, device=d)

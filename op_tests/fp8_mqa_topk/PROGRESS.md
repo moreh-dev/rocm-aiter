@@ -96,3 +96,30 @@ ISL 128K (ms, same run, `results/bench_step1b_128k.json`):
 | 10.918 | 8.998 | 9.171 | 9.293 | **8.952** | 9.032 |
 
 Per 16384 x 28672 chunk at S = 32 (us): sample + tau 151 (step 0: 79 + 50 + torch 23), EMIT 1500, select ~130.
+
+## 2026-11-07 - design review + emission epilogue (shared by every step)
+
+Three independent reviewers (correctness / memory model, gfx950 perf + ISA prototypes, step-4 feasibility vs PR 60618)
+read DESIGN.md and the sources; full reports in the session transcript, key findings:
+* Memory model: on gfx950 an agent-scope release does NOT wait for inline-asm VMEM stores (the candidate stores); every
+  hand-off needs an explicit `s_waitcnt vmcnt(0)` in every wave -> barrier -> one acq_rel agent atomic -> broadcast ->
+  acquire fence (`buffer_inv sc1`) in every reading wave. sc0 = workgroup scope, sc1 = agent scope.
+* Steps 3/4: empty row blocks and zero-work splits must still take part in the completion protocol.
+* Expected value of persistence on gfx950: ~1-2 %. One 8-wave WG per CU (VGPR-bound) means nothing overlaps inside a
+  CU, the PR does not overlap its select with the next scan either, launch gaps are ~0, and the static dispatch with the
+  makespan model is already at the work/256 bound for full chunks.
+* Emission codegen: Nam's literal `?:` port becomes exec branches that split the sched_barrier-pinned sub-tiles; my
+  SGPR-tau fix ("EV5") avoided the spill but costs +12.5 VALU per pair (the kernel is VALU-issue-bound). Branch-free
+  "EV4" (per-row SGPR counters, one full-wave mbcnt with a per-half correction, interleaved pair slots, overflow
+  dropped by the buffer range check) costs +7.5.
+
+Applied:
+* EMIT = EV4: 246 VGPR at PF 4, 236 at PF 2, 0 scratch, no exec branches in the loops, 0 permlane hazard violations
+  (`tools/permcheck.py`), vmcnt ladder unchanged. Clean loop 18.875 VALU/MFMA (dense 17.0, previous EMIT ~20).
+  **EMIT scan overhead over dense: +10.3 % -> +3.6 %** (16384x28672: 1.412 vs 1.363 ms; 16384x16384 +3.8 %,
+  13312x32000 +3.1 %).
+* PF = 2 costs nothing (dense PF2 == PF4 within 0.2 %, bit-exact; EMIT +0.1-0.5 %) and frees 10 VGPRs: the fused
+  kernels of steps 2-4 use PF 2.
+
+ISL 128K (ms, `results/bench_ev4_128k.json`): baseu 10.936 | hi16u 8.994 | **step 0 (S32) 8.554 (-21.8 %)** |
+step 1 (S32) 8.629 (-21.1 %).
