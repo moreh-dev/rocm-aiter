@@ -42,11 +42,25 @@ struct FusedArgs {
     float* fscratch;                // PERSIST: [G][N] per-WG fallback row
     int* nfb;                       // optional: fallback rows counter (stats)
     int dbg;                        // bit 0: tau = +inf (forces every non-empty row through the exact fallback)
+#ifdef FMT_TS
+    long long* ts;                  // debug probe: [bx][s][8] s_memrealtime at phase ends (wave 0)
+#endif
 };
+#ifdef FMT_TS
+#define FMT_TSP(k) do { if (A.ts && tid == 0) A.ts[((int64_t)bx * SplitN + s) * 8 + (k)] = (long long)__builtin_amdgcn_s_memrealtime(); } while (0)
+#else
+#define FMT_TSP(k) do {} while (0)
+#endif
 
 constexpr int FUSED_THREADS = 512;
+// Spin-waits poll with RELAXED agent-scope loads and acquire once (fence after the WG barrier): an acquire load per
+// iteration adds a buffer_inv sc1 (L2 invalidate) per poll, which slowed the producing WGs of a 576 x 250000 chunk
+// (14 splits) from 352 + 251 us (sample + tau) to 175 + 66 us when removed.
+#ifndef FMT_SPIN_SLEEP
+#define FMT_SPIN_SLEEP 2
+#endif
 #ifndef FMT_FUSED_SEL_RC
-#define FMT_FUSED_SEL_RC 32   // in-kernel select: candidates held in registers (rest through the radix path)
+#define FMT_FUSED_SEL_RC 48   // in-kernel select: candidates held in registers (rest through the radix path)
 #endif
 
 // In-kernel select of one row behind a call boundary: its register arrays then do not add to the scan's register
@@ -157,6 +171,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
             w2[r][2 * j + 1] = f32x2{wv[2], wv[3]};
         }
     }
+    FMT_TSP(0);
     // ---- WG-wide tile range (uniform across waves) ----
     int lo = INT_MAX, hi = 0, max_ks = 0, min_ke = INT_MAX;
     for (int r = 0; r < ROWS_WG; ++r) {
@@ -417,6 +432,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
             run_pipeline(std::true_type{}, 0, nst, lo_s, nst, nst);
         }
         wait_vmcnt<0>();
+        FMT_TSP(1);
         #pragma unroll 1
         for (int r = 0; r < BLOCK_M; ++r) {     // same-wave read-after-write of its own records
             const int ns = cnt_row[r];
@@ -439,9 +455,11 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
             __syncthreads();
             if (tid == 0) __hip_atomic_store(&A.tau_ready[bx], A.epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
         }
+        FMT_TSP(2);
     } else {
         if (tid == 0)
-            while (__hip_atomic_load(&A.tau_ready[bx], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) != A.epoch) __builtin_amdgcn_s_sleep(1);
+            while (__hip_atomic_load(&A.tau_ready[bx], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != A.epoch) __builtin_amdgcn_s_sleep(FMT_SPIN_SLEEP);
+        FMT_TSP(2);
         __syncthreads();
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         #pragma unroll
@@ -465,6 +483,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
     wait_vmcnt<0>();
     run_pipeline(std::false_type{}, cl_b, cl_e, lo, tc0, tc1);
     wait_vmcnt<0>();                         // load-bearing: candidate stores complete (memory model)
+    FMT_TSP(3);
     if (l == 0) {
         #pragma unroll
         for (int r = 0; r < BLOCK_M; ++r) {
@@ -505,6 +524,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
         }
         __syncthreads();                     // histograms / bcast free before the next item
     }
+    FMT_TSP(4);
 }
 
 template <bool FUSE_SELECT>
@@ -549,7 +569,7 @@ void fused_kernel(FusedArgs A)
         // ---- every item done (global barrier: all G WGs are resident, 1 per CU) -> drain the fallback list ----
         if (tid == 0) {
             __hip_atomic_fetch_add(&A.ctr[1], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
-            while (__hip_atomic_load(&A.ctr[1], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < G) __builtin_amdgcn_s_sleep(2);
+            while (__hip_atomic_load(&A.ctr[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < G) __builtin_amdgcn_s_sleep(FMT_SPIN_SLEEP);
         }
         __syncthreads();
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");

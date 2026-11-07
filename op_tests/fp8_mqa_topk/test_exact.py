@@ -14,13 +14,13 @@ QUICK = [  # (M, N, kind, reqs, causal)
     (16384, 4096, "rand", 1, True), (2048, 20000, "rand", 2, True), (777, 9000, "rand", 1, False),
     (4096, 24000, "offset", 1, True), (4096, 24000, "ties", 1, True), (4096, 64000, "periodic", 1, True),
     (4096, 24000, "increasing", 1, True), (576, 250000, "rand", 1, True),
-    (1500, 9000, "odd", 1, False),
+    (1500, 9000, "odd", 1, False), (1024, 196608, "increasing", 1, True),
 ]
 FULL = QUICK + [
     (16384, 16384, "rand", 1, True), (13312, 32000, "rand", 1, True), (8192, 2048, "rand", 1, True),
     (16384, 8192, "rand", 4, True), (64, 40000, "rand", 1, True), (33, 70000, "offset", 1, True),
     (16384, 32000, "offset", 1, True), (16384, 32000, "ties", 1, True), (8192, 128000, "periodic", 1, True),
-    (31, 513, "rand", 1, False), (100, 100, "rand", 1, False),
+    (31, 513, "rand", 1, False), (100, 100, "rand", 1, False), (2048, 131072, "ties", 1, True),
 ]
 
 

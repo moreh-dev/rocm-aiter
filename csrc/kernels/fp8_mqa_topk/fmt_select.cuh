@@ -162,6 +162,38 @@ __device__ __forceinline__ float wave_tau_relradix(const uint32_t (&rk)[R], int 
     return __builtin_bit_cast(float, okey32_inv(T));
 }
 
+// tau of a row with many samples (ns > 32 * 64, any ns; one wave): every lane keeps the T largest keys of its samples
+// i = lane + 64 j (branch-free insertion network, loads issued B at a time), then the relative radix runs on the 64 T
+// kept keys. The kept keys are a SUBSET of the samples, so their target-th largest is <= the samples' target-th
+// largest: tau stays a valid lower bound (it is lower - more candidates, still exact - only when one lane held more
+// than T of the top-`target` samples). Replaces the radix path with one dependent global load per step (2.9 ms on a
+// 576 x 250000 chunk at S = 32 inside the 1-WG/CU fused kernel). The caller checks target <= 16 T.
+template <int T, int B, typename LD>
+__device__ __forceinline__ float wave_tau_stream(LD& ld, int ns, int target, uint32_t* hist, int lane) {
+    uint32_t top[T];
+    #pragma unroll
+    for (int t = 0; t < T; ++t) top[t] = 0u;
+    #pragma unroll 1
+    for (int c0 = 0; c0 < ns; c0 += B * WARP) {   // wave-uniform trip count
+        uint32_t v[B];
+        #pragma unroll
+        for (int j = 0; j < B; ++j) {               // unconditional loads (clamped index), masked after
+            const int c = c0 + j * WARP + lane;
+            const float x = ld(min(c, ns - 1));
+            v[j] = c < ns ? okey32(__builtin_bit_cast(uint32_t, x)) : 0u;
+        }
+        #pragma unroll
+        for (int j = 0; j < B; ++j) {
+            uint32_t x = v[j];
+            #pragma unroll
+            for (int t = 0; t < T - 1; ++t) { const uint32_t h = max(top[t], x); x = min(top[t], x); top[t] = h; }
+            top[T - 1] = max(top[T - 1], x);
+        }
+    }
+    return wave_tau_relradix<T>(top, target, hist, lane);
+}
+constexpr int TAU_STREAM_T = 8, TAU_STREAM_B = 16;
+
 // Exact K-th largest of the keys rk (0 = empty slot) by a RELATIVE radix: 8-bit LDS-histogram passes starting just
 // below the common prefix of the row's min / max key; stops as soon as the boundary bin holds exactly the keys still
 // needed (then every key >= the bin's lower edge is selected). Returns T / above / cnt_eq in wave_emit's convention:
@@ -236,6 +268,10 @@ __device__ __forceinline__ float wave_tau(const float* __restrict__ srow, int a,
     if (ns <= 16 * WARP) return wave_tau_regs<16, COHERENT>(srow, a, b, target, hist, lane);
     if (ns <= 32 * WARP) return wave_tau_regs<32, COHERENT>(srow, a, b, target, hist, lane);
     if constexpr (COHERENT) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    if (target <= 16 * TAU_STREAM_T) {
+        auto ld = [&](int i) -> float { return srow[a + i]; };
+        return wave_tau_stream<TAU_STREAM_T, TAU_STREAM_B>(ld, ns, target, hist, lane);
+    }
     constexpr int RT = 32;                          // first RT * 64 samples held in VGPRs (one read), rest re-read
     uint32_t rk[RT];
     #pragma unroll
@@ -336,6 +372,7 @@ __device__ __forceinline__ float wave_tau_ld(LD&& ld, int ns, int nvalid, int K,
     if (ns <= 8 * WARP) return wave_tau_ld_regs<8>(ld, ns, target, hist, lane);
     if (ns <= 16 * WARP) return wave_tau_ld_regs<16>(ld, ns, target, hist, lane);
     if (ns <= 32 * WARP) return wave_tau_ld_regs<32>(ld, ns, target, hist, lane);
+    if (target <= 16 * TAU_STREAM_T) return wave_tau_stream<TAU_STREAM_T, TAU_STREAM_B>(ld, ns, target, hist, lane);
     constexpr int RT = 32;
     uint32_t rk[RT];
     #pragma unroll
@@ -495,7 +532,8 @@ __device__ __forceinline__ bool wave_select_row_auto(const unsigned long long* _
     for (int d = 32; d >= 1; d >>= 1) C += __shfl_xor(C, d);
     if (C <= 16 * WARP) return wave_select_row<16, COHERENT>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus);
     if (C <= 24 * WARP) return wave_select_row<24, COHERENT>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus);
-    return wave_select_row<32, COHERENT>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus, surv);
+    if (C <= 32 * WARP) return wave_select_row<32, COHERENT>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus, surv);
+    return wave_select_row<48, COHERENT>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus);
 }
 
 template <int RC, bool SURVIVORS = false>

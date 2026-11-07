@@ -162,6 +162,10 @@ int fmt_fused_nsb(int N, int split, int S) {   // split 0 samples the whole bloc
     (void)split;
     return FMT_CDIV((FMT_CDIV(N, 64) + 1) * 64, S) + 2;
 }
+#ifdef FMT_TS
+static long long* g_ts = nullptr;
+int fmt_set_ts(void* p) { g_ts = (long long*)p; return 0; }
+#endif
 static FusedArgs make_args(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke,
                            int M, int N, int split, int S, int K, int cap, int nsb, unsigned long long* smp,
                            unsigned long long* cand, int* cnt, float* tau, int* tau_ready, int epoch, int* out, int* flag,
@@ -172,6 +176,9 @@ static FusedArgs make_args(const void* q, const void* k, const float* sc, const 
     a.smp = smp; a.cand = cand; a.cnt = cnt; a.tau = tau; a.tau_ready = tau_ready; a.epoch = epoch;
     a.out = out; a.flag = flag; a.fbc = fbc;
     a.block_done = block_done; a.ctr = ctr; a.fscratch = fscratch; a.nfb = nfb; a.dbg = dbg;
+#ifdef FMT_TS
+    a.ts = g_ts;
+#endif
     return a;
 }
 
