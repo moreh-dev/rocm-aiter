@@ -1,0 +1,338 @@
+{
+ "args": {
+  "isl": "128000",
+  "shapes": "",
+  "paths": "step2,step3,step4",
+  "kind": "rand",
+  "reqs": 1,
+  "iters": 10,
+  "rounds": 3,
+  "no_check": false,
+  "out": "results/bench_step4b_128k.json"
+ },
+ "chunks": {
+  "16384x4096": {
+   "M": 16384,
+   "N": 4096,
+   "ms": {
+    "step2": 0.24532200396060944,
+    "step3": 0.31272199749946594,
+    "step4": 0.4395029991865158
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1160.7833251953125,
+     "cand_max": 1933,
+     "tau_ninf": 5631,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1160.7833251953125,
+     "cand_max": 1933,
+     "tau_ninf": 5631,
+     "fallback_rows": 0
+    },
+    "step4": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1160.7833251953125,
+     "cand_max": 1933,
+     "tau_ninf": 5631,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x8192": {
+   "M": 16384,
+   "N": 8192,
+   "ms": {
+    "step2": 0.47832299768924713,
+    "step3": 0.548083484172821,
+    "step4": 0.6136835217475891
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1416.960693359375,
+     "cand_max": 2260,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1416.960693359375,
+     "cand_max": 2260,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step4": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1416.960693359375,
+     "cand_max": 2260,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x12288": {
+   "M": 16384,
+   "N": 12288,
+   "ms": {
+    "step2": 0.6984440088272095,
+    "step3": 0.7698844969272614,
+    "step4": 0.8309450149536133
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1422.0390625,
+     "cand_max": 2223,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1422.0390625,
+     "cand_max": 2223,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step4": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1422.0390625,
+     "cand_max": 2223,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x16384": {
+   "M": 16384,
+   "N": 16384,
+   "ms": {
+    "step2": 0.9212055206298828,
+    "step3": 0.9883259832859039,
+    "step4": 1.0634859800338745
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1429.63916015625,
+     "cand_max": 2390,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1429.63916015625,
+     "cand_max": 2390,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step4": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1429.63916015625,
+     "cand_max": 2390,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x20480": {
+   "M": 16384,
+   "N": 20480,
+   "ms": {
+    "step2": 1.1634469628334045,
+    "step3": 1.2125074863433838,
+    "step4": 1.2861075401306152
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1438.4658203125,
+     "cand_max": 2300,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1438.4658203125,
+     "cand_max": 2300,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step4": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1438.4658203125,
+     "cand_max": 2300,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x24576": {
+   "M": 16384,
+   "N": 24576,
+   "ms": {
+    "step2": 1.3930284976959229,
+    "step3": 1.4417889714241028,
+    "step4": 1.5052890181541443
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1439.5762939453125,
+     "cand_max": 2281,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1439.5762939453125,
+     "cand_max": 2281,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step4": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1439.5762939453125,
+     "cand_max": 2281,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x28672": {
+   "M": 16384,
+   "N": 28672,
+   "ms": {
+    "step2": 1.610709011554718,
+    "step3": 1.6609694957733154,
+    "step4": 1.7343499660491943
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1443.076171875,
+     "cand_max": 2457,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1443.076171875,
+     "cand_max": 2457,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step4": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1443.076171875,
+     "cand_max": 2457,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "13312x32000": {
+   "M": 13312,
+   "N": 32000,
+   "ms": {
+    "step2": 1.5653089880943298,
+    "step3": 1.6685699820518494,
+    "step4": 1.9275320172309875
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 3,
+     "cand_mean": 1405.242431640625,
+     "cand_max": 2276,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 3,
+     "cand_mean": 1405.242431640625,
+     "cand_max": 2276,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step4": {
+     "wrong": 0,
+     "split": 3,
+     "cand_mean": 1405.242431640625,
+     "cand_max": 2276,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  }
+ },
+ "isl": {
+  "128000": {
+   "chunks": [
+    [
+     16384,
+     4096
+    ],
+    [
+     16384,
+     8192
+    ],
+    [
+     16384,
+     12288
+    ],
+    [
+     16384,
+     16384
+    ],
+    [
+     16384,
+     20480
+    ],
+    [
+     16384,
+     24576
+    ],
+    [
+     16384,
+     28672
+    ],
+    [
+     13312,
+     32000
+    ]
+   ],
+   "ms": {
+    "step2": 8.075787991285324,
+    "step3": 8.602851897478104,
+    "step4": 9.400896057486534
+   }
+  }
+ }
+}

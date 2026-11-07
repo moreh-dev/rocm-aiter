@@ -1,0 +1,265 @@
+{
+ "args": {
+  "isl": "128000",
+  "shapes": "",
+  "paths": "step2,step3",
+  "kind": "rand",
+  "reqs": 1,
+  "iters": 10,
+  "rounds": 3,
+  "no_check": false,
+  "out": "results/bench_step3b_128k.json"
+ },
+ "chunks": {
+  "16384x4096": {
+   "M": 16384,
+   "N": 4096,
+   "ms": {
+    "step2": 0.25140099227428436,
+    "step3": 0.30838100612163544
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1160.7833251953125,
+     "cand_max": 1933,
+     "tau_ninf": 5631,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1160.7833251953125,
+     "cand_max": 1933,
+     "tau_ninf": 5631,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x8192": {
+   "M": 16384,
+   "N": 8192,
+   "ms": {
+    "step2": 0.4806225001811981,
+    "step3": 0.5404230058193207
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1416.960693359375,
+     "cand_max": 2260,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1416.960693359375,
+     "cand_max": 2260,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x12288": {
+   "M": 16384,
+   "N": 12288,
+   "ms": {
+    "step2": 0.6978429853916168,
+    "step3": 0.7654035091400146
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1422.0390625,
+     "cand_max": 2223,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1422.0390625,
+     "cand_max": 2223,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x16384": {
+   "M": 16384,
+   "N": 16384,
+   "ms": {
+    "step2": 0.9197444915771484,
+    "step3": 0.9934049844741821
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1429.63916015625,
+     "cand_max": 2390,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1429.63916015625,
+     "cand_max": 2390,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x20480": {
+   "M": 16384,
+   "N": 20480,
+   "ms": {
+    "step2": 1.1610260009765625,
+    "step3": 1.2245060205459595
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1438.4658203125,
+     "cand_max": 2300,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1438.4658203125,
+     "cand_max": 2300,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x24576": {
+   "M": 16384,
+   "N": 24576,
+   "ms": {
+    "step2": 1.3880069851875305,
+    "step3": 1.4633269906044006
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1439.5762939453125,
+     "cand_max": 2281,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1439.5762939453125,
+     "cand_max": 2281,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x28672": {
+   "M": 16384,
+   "N": 28672,
+   "ms": {
+    "step2": 1.607268512248993,
+    "step3": 1.6913084983825684
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1443.076171875,
+     "cand_max": 2457,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1443.076171875,
+     "cand_max": 2457,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "13312x32000": {
+   "M": 13312,
+   "N": 32000,
+   "ms": {
+    "step2": 1.5675479769706726,
+    "step3": 1.7008484601974487
+   },
+   "info": {
+    "step2": {
+     "wrong": 0,
+     "split": 3,
+     "cand_mean": 1405.242431640625,
+     "cand_max": 2276,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 3,
+     "cand_mean": 1405.242431640625,
+     "cand_max": 2276,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  }
+ },
+ "isl": {
+  "128000": {
+   "chunks": [
+    [
+     16384,
+     4096
+    ],
+    [
+     16384,
+     8192
+    ],
+    [
+     16384,
+     12288
+    ],
+    [
+     16384,
+     16384
+    ],
+    [
+     16384,
+     20480
+    ],
+    [
+     16384,
+     24576
+    ],
+    [
+     16384,
+     28672
+    ],
+    [
+     13312,
+     32000
+    ]
+   ],
+   "ms": {
+    "step2": 8.073460444808006,
+    "step3": 8.68760247528553
+   }
+  }
+ }
+}

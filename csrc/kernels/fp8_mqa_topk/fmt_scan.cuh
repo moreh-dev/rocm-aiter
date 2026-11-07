@@ -469,7 +469,8 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
         if (Ktop <= 0) return;   // debug: sample pass only
         // tau of my 4 rows from the samples this wave just stored (coherent re-reads); k_lds is free after the barrier
         __syncthreads();
-        uint32_t* hist = reinterpret_cast<uint32_t*>(&k_lds[0][0]) + warp * 256;
+        __shared__ uint32_t hist_lds[NUM_WARPS][256];
+        uint32_t* hist = hist_lds[warp];
         float t4[4];
 #ifndef FMT_TAU_DEBUG
 #define FMT_TAU_DEBUG 0

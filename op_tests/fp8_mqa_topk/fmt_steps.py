@@ -23,6 +23,10 @@ def lib():
             "fmt_select0": [c_vp, c_vp, c_int, c_int, c_vp, c_vp, c_int, c_int, c_int] + [c_vp] * 10,
             "fmt_sample_tau": [c_vp] * 7 + [c_int] * 5 + [c_vp, c_vp, c_vp],
             "fmt_select1": [c_vp, c_vp, c_int, c_int, c_vp, c_vp, c_int, c_int, c_int] + [c_vp] * 11,
+            "fmt_fused_nsb": [c_int, c_int, c_int],
+            "fmt_step2": [c_vp] * 6 + [c_int] * 8 + [c_vp] * 5 + [c_int] + [c_vp] * 6 + [c_int, c_vp],
+            "fmt_step3": [c_vp] * 6 + [c_int] * 8 + [c_vp] * 5 + [c_int] + [c_vp] * 8 + [c_int, c_vp],
+            "fmt_step4": [c_vp] * 6 + [c_int] * 8 + [c_vp] * 5 + [c_int] + [c_vp] * 7 + [c_int, c_vp],
         }
         for name, args in sig.items():
             fn = getattr(L, name)
@@ -122,3 +126,95 @@ class Step1(Step0):
         _ck(L.fmt_select1(p(self.cand), p(self.cnt), self.split, self.cap, p(ks), p(ke), M, N, self.K, p(out), p(self.flag),
                           p(self.fbc), p(self.done), p(self.scratch), p(q8), p(k8), p(sc), p(w),
                           p(self.nfb) if count_fb else None, st), "select1")
+
+
+class Step2:
+    """Step 2: fused scan kernel (per split: strided sample pass + tau + EMIT; per-split exactness counters) ->
+    select (per-split need) -> fallback1. 3 launches."""
+    name = "step2"
+    NAME = "fmt_step2"
+
+    def __init__(self, S=32, cap=4096, K=F.TOPK):
+        self.S, self.cap, self.K = S, cap, K
+        self.shape = None
+        self.force_fallback = False
+
+    def prep(self, M, N):
+        d = "cuda"
+        self.split, self.rev = choice(M, N)
+        self.nsb = lib().fmt_fused_nsb(N, self.split, self.S)
+        self.rb = (M + 31) // 32
+        Mp = M + (M & 1)
+        self.smp = torch.empty(Mp * self.nsb, dtype=torch.int64, device=d)
+        self.tau = torch.empty(M, device=d)
+        self.tau_ready = torch.zeros(self.rb, dtype=torch.int32, device=d)
+        self.epoch = 0
+        self.cand = torch.empty(self.split * Mp * self.cap, dtype=torch.int64, device=d)
+        self.cnt = torch.empty(self.split * M, dtype=torch.int32, device=d)
+        self.flag = torch.empty(M, dtype=torch.int32, device=d)
+        self.fbc = torch.zeros(1, dtype=torch.int32, device=d)
+        self.done = torch.zeros(64, dtype=torch.int32, device=d)
+        self.block_done = torch.zeros(self.rb, dtype=torch.int32, device=d)
+        self.fb_exit = torch.zeros(1, dtype=torch.int32, device=d)
+        self.scratch = torch.empty(128 * N, device=d)
+        self.nfb = torch.zeros(1, dtype=torch.int32, device=d)
+        self.shape = (M, N)
+
+    def _launch(self, q8, k8, sc, w, ks, ke, out, nfb):
+        M, N = q8.shape[0], k8.shape[0]
+        L, p, st = lib(), F.ptr, F.stream()
+        _ck(L.fmt_step2(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), M, N, self.split, self.rev, self.S, self.K, self.cap,
+                        self.nsb, p(self.smp), p(self.cand), p(self.cnt), p(self.tau), p(self.tau_ready), self._ep(), p(out),
+                        p(self.flag), p(self.fbc), p(self.done), p(self.scratch), nfb, int(self.force_fallback), st), self.NAME)
+
+    def _ep(self):
+        self.epoch = self.epoch % 2000000000 + 1
+        return self.epoch
+
+    def __call__(self, q8, k8, sc, w, ks, ke, out, count_fb=False):
+        M, N = q8.shape[0], k8.shape[0]
+        if self.shape != (M, N):
+            self.prep(M, N)
+        self._launch(q8, k8, sc, w, ks, ke, out, F.ptr(self.nfb) if count_fb else None)
+
+    def stats(self, M):
+        cn = self.cnt.view(self.split, M).sum(0).float()
+        return dict(split=self.split, cand_mean=float(cn.mean()), cand_max=int(cn.max()), tau_ninf=int(torch.isinf(self.tau).sum()),
+                    fallback_rows=int(self.nfb.item()))
+
+
+class Step3(Step2):
+    """Step 3: fused scan kernel + in-kernel select by the last split of each row block -> fallback1. 2 launches."""
+    name = "step3"
+    NAME = "fmt_step3"
+
+    def _launch(self, q8, k8, sc, w, ks, ke, out, nfb):
+        M, N = q8.shape[0], k8.shape[0]
+        L, p, st = lib(), F.ptr, F.stream()
+        _ck(L.fmt_step3(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), M, N, self.split, self.rev, self.S, self.K, self.cap,
+                        self.nsb, p(self.smp), p(self.cand), p(self.cnt), p(self.tau), p(self.tau_ready), self._ep(), p(out),
+                        p(self.flag), p(self.fbc), p(self.block_done), p(self.done), p(self.fb_exit), p(self.scratch), nfb,
+                        int(self.force_fallback), st), self.NAME)
+
+
+class Step4(Step2):
+    """Step 4: ONE persistent launch (1 WG per CU claims (row block, split) items heaviest first; sample + row-wide tau
+    + EMIT + in-kernel select of the block by its last split; in-kernel exact fallback drain; self-resetting counters)."""
+    name = "step4"
+    NAME = "fmt_step4"
+    G = 256
+
+    def prep(self, M, N):
+        super().prep(M, N)
+        d = "cuda"
+        self.smp = torch.empty(self.G * 32 * self.nsb, dtype=torch.int64, device=d)
+        self.ctr = torch.zeros(4, dtype=torch.int32, device=d)
+        self.fscratch = torch.empty(self.G * N, device=d)
+
+    def _launch(self, q8, k8, sc, w, ks, ke, out, nfb):
+        M, N = q8.shape[0], k8.shape[0]
+        L, p, st = lib(), F.ptr, F.stream()
+        _ck(L.fmt_step4(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), M, N, self.split, self.S, self.K, self.cap, self.nsb,
+                        self.G, p(self.smp), p(self.cand), p(self.cnt), p(self.tau), p(self.tau_ready), self._ep(), p(out),
+                        p(self.flag), p(self.fbc), p(self.block_done), p(self.ctr), p(self.fscratch), nfb,
+                        int(self.force_fallback), st), self.NAME)

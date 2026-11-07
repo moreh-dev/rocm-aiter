@@ -25,12 +25,12 @@ FULL = QUICK + [
 
 
 def make_step(step, **kw):
-    return {0: S.Step0, 1: S.Step1}[step](**kw)
+    return {0: S.Step0, 1: S.Step1, 2: S.Step2, 3: S.Step3, 4: S.Step4}[step](**kw)
 
 
 def poison(st):
     """Fill every workspace buffer of a step with garbage before a call (stale-state bugs must not pass)."""
-    for name in ("ls", "tau", "cand", "cnt", "flag", "scratch"):
+    for name in ("ls", "tau", "cand", "cnt", "flag", "scratch", "smp", "fscratch"):
         t = getattr(st, name, None)
         if t is not None:
             if t.dtype.is_floating_point:

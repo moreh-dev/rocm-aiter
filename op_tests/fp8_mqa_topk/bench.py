@@ -20,6 +20,9 @@ PATHS = {
     "step1": lambda: S.Step1(),
     "step0s32": lambda: S.Step0(S=32),
     "step1s32": lambda: S.Step1(S=32),
+    "step2": lambda: S.Step2(S=32),
+    "step3": lambda: S.Step3(S=32),
+    "step4": lambda: S.Step4(S=32),
 }
 
 

@@ -5,6 +5,7 @@
 // (op_tests/fp8_mqa_topk). Every function returns hipGetLastError() (0 = ok) or a negative argument error.
 #include "fmt_scan.cuh"
 #include "fmt_select.cuh"
+#include "fmt_fused.cuh"
 
 #include <algorithm>
 #include <cstdio>
@@ -152,6 +153,76 @@ int fmt_emit_pf2(const void* q, const void* k, const float* sc, const float* w, 
     dim3 grid(FMT_CDIV(M, 32), split);
     if (rev) scan_kernel<8, 2, 2, MODE_EMIT, true><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, nullptr, 0, 1, tau, cand, cnt, cap, nullptr, 0, nullptr);
     else     scan_kernel<8, 2, 2, MODE_EMIT, false><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, nullptr, 0, 1, tau, cand, cnt, cap, nullptr, 0, nullptr);
+    return (int)hipGetLastError();
+}
+
+// ---------------------------------------------------------------------------------------------- steps 2-4
+// sample records per (row, split): the split's stage range is at most ceil((ceil(N/64) + 1) / SplitN) stages
+int fmt_fused_nsb(int N, int split, int S) {   // split 0 samples the whole block range: <= ceil(N/64) + 1 stages
+    (void)split;
+    return FMT_CDIV((FMT_CDIV(N, 64) + 1) * 64, S) + 2;
+}
+static FusedArgs make_args(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke,
+                           int M, int N, int split, int S, int K, int cap, int nsb, unsigned long long* smp,
+                           unsigned long long* cand, int* cnt, float* tau, int* tau_ready, int epoch, int* out, int* flag,
+                           int* fbc, int* block_done, int* ctr, float* fscratch, int* nfb, int dbg) {
+    FusedArgs a;
+    a.Q = (fp8p)q; a.K = (fp8p)k; a.kv_scale = sc; a.W = w; a.ks = ks; a.ke = ke;
+    a.M = M; a.N = N; a.SplitN = split; a.S = S; a.Ktop = K; a.CAP = cap; a.NSB = nsb; a.rb = FMT_CDIV(M, 32);
+    a.smp = smp; a.cand = cand; a.cnt = cnt; a.tau = tau; a.tau_ready = tau_ready; a.epoch = epoch;
+    a.out = out; a.flag = flag; a.fbc = fbc;
+    a.block_done = block_done; a.ctr = ctr; a.fscratch = fscratch; a.nfb = nfb; a.dbg = dbg;
+    return a;
+}
+
+// step 2: fused scan (sample + tau + EMIT per split; resets *fbc) -> select (per-split need) -> fallback1. 3 launches.
+// smp: float[split * M * nsb], cand: u64[split * Mp * cap], cnt / need: int[split * M], done: int[64] zeroed once.
+int fmt_step2(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke, int M, int N,
+              int split, int rev, int S, int K, int cap, int nsb, unsigned long long* smp, unsigned long long* cand, int* cnt,
+              float* tau, int* tau_ready, int epoch, int* out, int* flag, int* fbc, int* done, float* scratch, int* nfb, int dbg, hipStream_t st) {
+    if (M <= 0 || N <= 0) return 0;
+    if (split < 1 || split > 16) return -5;
+    FusedArgs a = make_args(q, k, sc, w, ks, ke, M, N, split, S, K, cap, nsb, smp, cand, cnt, tau, tau_ready, epoch, out, flag, fbc,
+                            nullptr, nullptr, nullptr, nfb, dbg);
+    dim3 grid(a.rb, split);
+    if (rev) fused_kernel<false, false, true><<<grid, FUSED_THREADS, 0, st>>>(a);
+    else     fused_kernel<false, false, false><<<grid, FUSED_THREADS, 0, st>>>(a);
+    if (dbg & 2) return (int)hipGetLastError();     // debug: fused kernel only
+    select_kernel<32><<<FMT_CDIV(M, 4), 256, 0, st>>>(cand, cnt, split, cap, ks, ke, M, N, K, out, flag, fbc);
+    fallback1_kernel<<<64, 256, 0, st>>>(flag, fbc, done, ks, ke, M, N, K, out, scratch, (fp8p)q, (fp8p)k, sc, w, nfb);
+    return (int)hipGetLastError();
+}
+
+// step 3: fused scan + in-kernel select by the last split of each block -> fallback1 (resets *fbc). 2 launches.
+// block_done: int[rb] and fb_exit: int[1] zeroed once (self-resetting).
+int fmt_step3(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke, int M, int N,
+              int split, int rev, int S, int K, int cap, int nsb, unsigned long long* smp, unsigned long long* cand, int* cnt,
+              float* tau, int* tau_ready, int epoch, int* out, int* flag, int* fbc, int* block_done, int* done, int* fb_exit, float* scratch,
+              int* nfb, int dbg, hipStream_t st) {
+    if (M <= 0 || N <= 0) return 0;
+    if (split < 1 || split > 16) return -5;
+    FusedArgs a = make_args(q, k, sc, w, ks, ke, M, N, split, S, K, cap, nsb, smp, cand, cnt, tau, tau_ready, epoch, out, flag, fbc,
+                            block_done, nullptr, nullptr, nfb, dbg);
+    dim3 grid(a.rb, split);
+    if (rev) fused_kernel<true, false, true><<<grid, FUSED_THREADS, 0, st>>>(a);
+    else     fused_kernel<true, false, false><<<grid, FUSED_THREADS, 0, st>>>(a);
+    fallback1_kernel<<<64, 256, 0, st>>>(flag, fbc, done, ks, ke, M, N, K, out, scratch, (fp8p)q, (fp8p)k, sc, w, nfb, fb_exit);
+    return (int)hipGetLastError();
+}
+
+// step 4: ONE persistent launch, G workgroups (<= #CUs, 1 per CU). smp: float[G * 32 * nsb], fscratch: float[G * N],
+// ctr: int[4] and block_done: int[rb] zeroed once (self-resetting); fbc reset by the last WG.
+int fmt_step4(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke, int M, int N,
+              int split, int S, int K, int cap, int nsb, int G, unsigned long long* smp, unsigned long long* cand, int* cnt,
+              float* tau, int* tau_ready, int epoch, int* out, int* flag, int* fbc, int* block_done, int* ctr, float* fscratch, int* nfb,
+              int dbg, hipStream_t st) {
+    if (M <= 0 || N <= 0) return 0;
+    if (split < 1 || split > 16) return -5;
+    FusedArgs a = make_args(q, k, sc, w, ks, ke, M, N, split, S, K, cap, nsb, smp, cand, cnt, tau, tau_ready, epoch, out, flag, fbc,
+                            block_done, ctr, fscratch, nfb, dbg);
+    const int items = a.rb * split;
+    if (G > items) G = items;
+    fused_kernel<true, true, false><<<G, FUSED_THREADS, 0, st>>>(a);
     return (int)hipGetLastError();
 }
 
