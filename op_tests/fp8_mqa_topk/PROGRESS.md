@@ -59,3 +59,40 @@ select, fallback), `fp8_mqa_topk_capi.cu`; driver `fmt_steps.Step0`.
   torch prep + sample + tau 0.227, select (4 kernels) 0.142; total 1.857 (hi16u 1.767).
   -> The remaining gap to hi16u is the emission cost in the scan epilogue (~0.14 ms) plus the separate sample
   (~0.23 ms) and select (~0.14 ms) passes. Steps 1-4 remove the passes; the emission epilogue needs its own VALU work.
+
+## 2026-11-07 - step 1: 4 launches (sample+tau kernel, EMIT, select, 1 fallback kernel)
+
+* `MODE_SAMPLE` scan: strided DENSE pipeline over the sample keys j*S (per-lane voffset (t*S)*128 + piece*16,
+  soffset token_base*S*128, window [ceil(ks/S), ceil(ke/S))), SplitN = 1, then tau of the wave's 4 rows in the kernel
+  tail; resets the fallback counter. Gate: the stored samples are bit-identical to the dense logits at j*S.
+* `fallback1_kernel`: the 3 fallback kernels merged; per-row completion counters (acq_rel, agent scope) let the wave
+  that completes a row's last 32-token block run its select and reset the counter. A first version overran its
+  scratch (256 waves x one-wave-per-row path) and faulted the GPU process; now only 64 waves take that path.
+* New gates in `test_exact.py` (review findings): EMIT with tau = -inf emits every valid (m, n) exactly once with
+  dense bits (SplitN up to 16), strided samples == dense, odd windows (ks < 0, ke > N, ke < ks), poisoned workspaces.
+  Step 0 and step 1: all cases + gates pass.
+
+**Why step 1 is not faster than step 0 (measured):**
+* Launches are free here. A rocprofv3 kernel trace of the pipelines shows ~0 us between back-to-back kernels queued
+  from ctypes (the GPU never waits for the host); only the 6 tiny torch ops of step 0 can leave gaps, and only when
+  the GPU is idle when they are enqueued (in the benchmark and in serving they queue behind other work: ~23 us of GPU
+  time per chunk).
+* What moves into the sample kernel's tail gets SLOWER: tau runs at the scan kernel's occupancy (1 WG / CU, 2 waves /
+  SIMD) instead of 7 waves / SIMD in its own kernel, and the per-row selection is latency-bound. The strided sample
+  pass is also ~10 % slower than the dense kernel on a compacted K[::S] (88 vs 79 us at S = 32).
+* Investigating the tail found three real problems, all fixed (they also sped up step 0's tau and select):
+  1. conditional loads written as atomics (`c < b ? load : 0`) compiled to one exec branch + flat_load + vmcnt(0) per
+     load -> made unconditional (clamped index, masked after);
+  2. ballot + s_bcnt1 per register serialized every compare through VCC -> per-lane VALU count + DPP reduction;
+  3. the 20/32-step bitwise search costs ~1000 VALU per row (PMC: tail = 16.2 M VALU) -> relative two-pass radix
+     (8 bits below the common prefix of the row's min/max sample, then 8 more inside the boundary bin; resolution
+     ~spread / 2^16 independent of the score offset): 8.7 M VALU, tail 78 -> 63 us at S = 32.
+* S = 32 beats S = 16 for every fused variant (sample + tau cost ~1/S, candidates grow only ~target * S).
+
+ISL 128K (ms, same run, `results/bench_step1b_128k.json`):
+
+| baseu | hi16u | step 0 S16 | step 1 S16 | step 0 S32 | step 1 S32 |
+|---|---|---|---|---|---|
+| 10.918 | 8.998 | 9.171 | 9.293 | **8.952** | 9.032 |
+
+Per 16384 x 28672 chunk at S = 32 (us): sample + tau 151 (step 0: 79 + 50 + torch 23), EMIT 1500, select ~130.

@@ -21,6 +21,8 @@ def lib():
             "fmt_tau": [c_vp, c_int, c_int, c_vp, c_vp, c_int, c_int, c_int, c_int, c_vp, c_vp, c_vp],
             "fmt_emit": [c_vp] * 9 + [c_int] * 5 + [c_vp, c_vp],
             "fmt_select0": [c_vp, c_vp, c_int, c_int, c_vp, c_vp, c_int, c_int, c_int] + [c_vp] * 10,
+            "fmt_sample_tau": [c_vp] * 7 + [c_int] * 5 + [c_vp, c_vp, c_vp],
+            "fmt_select1": [c_vp, c_vp, c_int, c_int, c_vp, c_vp, c_int, c_int, c_int] + [c_vp] * 11,
         }
         for name, args in sig.items():
             fn = getattr(L, name)
@@ -95,3 +97,28 @@ class Step0:
         cn = self.cnt.view(self.split, M).sum(0).float()
         return dict(split=self.split, cand_mean=float(cn.mean()), cand_max=int(cn.max()),
                     tau_ninf=int(torch.isinf(self.tau).sum()), fallback_rows=int(self.nfb.item()))
+
+
+class Step1(Step0):
+    """Step 1: ONE sample kernel (strided DENSE scan over keys j*S + tau in its tail, resets fbc), EMIT scan (row-wide
+    tau, v35wes split), select + ONE fallback kernel. 4 launches, no torch ops."""
+    name = "step1"
+
+    def prep(self, M, N):
+        super().prep(M, N)
+        self.done = torch.zeros(64, dtype=torch.int32, device="cuda")   # FBR completion counters (self-resetting)
+
+    def __call__(self, q8, k8, sc, w, ks, ke, out, count_fb=False):
+        M, N, S = q8.shape[0], k8.shape[0], self.S
+        if self.shape != (M, N):
+            self.prep(M, N)
+        L, p, st = lib(), F.ptr, F.stream()
+        _ck(L.fmt_sample_tau(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), p(self.ls), M, N, S, self.K, self.cap, p(self.tau),
+                             p(self.fbc), st), "sample_tau")
+        if self.force_fallback:
+            self.tau.fill_(float("inf"))
+        _ck(L.fmt_emit(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), p(self.tau), p(self.cand), p(self.cnt), self.cap, M, N,
+                       self.split, self.rev, None, st), "emit")
+        _ck(L.fmt_select1(p(self.cand), p(self.cnt), self.split, self.cap, p(ks), p(ke), M, N, self.K, p(out), p(self.flag),
+                          p(self.fbc), p(self.done), p(self.scratch), p(q8), p(k8), p(sc), p(w),
+                          p(self.nfb) if count_fb else None, st), "select1")

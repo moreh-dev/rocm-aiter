@@ -75,8 +75,8 @@ int fmt_dense(const void* q, const void* k, const float* sc, const float* w, con
     if (M <= 0 || N <= 0) return 0;
     resolve_grid(M, N, split, rev);
     dim3 grid(FMT_CDIV(M, 32), split);
-    if (rev) scan_kernel<8, 2, 4, MODE_DENSE, false, true><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, out, out_cols, 1, nullptr, nullptr, nullptr, 0);
-    else     scan_kernel<8, 2, 4, MODE_DENSE, false, false><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, out, out_cols, 1, nullptr, nullptr, nullptr, 0);
+    if (rev) scan_kernel<8, 2, 4, MODE_DENSE, true><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, out, out_cols, 1, nullptr, nullptr, nullptr, 0, nullptr, 0, nullptr);
+    else     scan_kernel<8, 2, 4, MODE_DENSE, false><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, out, out_cols, 1, nullptr, nullptr, nullptr, 0, nullptr, 0, nullptr);
     return (int)hipGetLastError();
 }
 
@@ -93,8 +93,8 @@ int fmt_emit(const void* q, const void* k, const float* sc, const float* w, cons
     resolve_grid(M, N, split, rev);
     if (split_used) *split_used = split;
     dim3 grid(FMT_CDIV(M, 32), split);
-    if (rev) scan_kernel<8, 2, 4, MODE_EMIT, false, true><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, nullptr, 0, 1, tau, cand, cnt, cap);
-    else     scan_kernel<8, 2, 4, MODE_EMIT, false, false><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, nullptr, 0, 1, tau, cand, cnt, cap);
+    if (rev) scan_kernel<8, 2, 4, MODE_EMIT, true><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, nullptr, 0, 1, tau, cand, cnt, cap, nullptr, 0, nullptr);
+    else     scan_kernel<8, 2, 4, MODE_EMIT, false><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, split, nullptr, 0, 1, tau, cand, cnt, cap, nullptr, 0, nullptr);
     return (int)hipGetLastError();
 }
 
@@ -108,6 +108,29 @@ int fmt_select0(const unsigned long long* cand, const int* cnt, int nsplit, int 
     fb_compute<<<64, 256, 0, st>>>(flag, fbc, ks, ke, M, N, scratch, (fp8p)q, (fp8p)kc, sc, w);
     fb_select<<<FBR / 4, 256, 0, st>>>(flag, fbc, ks, ke, M, N, K, out, scratch, nfb);
     fallback_kernel<<<16, 256, 0, st>>>(flag, fbc, ks, ke, M, N, K, out, scratch, (fp8p)q, (fp8p)kc, sc, w, nfb);
+    return (int)hipGetLastError();
+}
+
+// step-1 sample pass: ONE kernel = strided DENSE scan over the sample keys j*S (fp32 samples -> ls[M, Ns]) with SplitN = 1,
+// then tau of every row in the kernel tail; also resets *fbc. Ns must be ceil(N / S).
+int fmt_sample_tau(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke, float* ls,
+                   int M, int N, int S, int K, int cap, float* tau, int* fbc, hipStream_t st) {
+    if (M <= 0) return 0;
+    if (S < 1) return -6;
+    const int Ns = FMT_CDIV(N, S);
+    dim3 grid(FMT_CDIV(M, 32), 1);
+    scan_kernel<8, 2, 4, MODE_SAMPLE, true><<<grid, 512, 0, st>>>((fp8p)q, (fp8p)k, sc, w, ks, ke, M, N, 1, ls, Ns, S,
+                                                                   nullptr, nullptr, nullptr, cap, tau, K, fbc);
+    return (int)hipGetLastError();
+}
+
+// step-1 select: select_kernel + ONE fallback kernel (2 launches). done: int[FBR] zeroed once (self-resetting).
+int fmt_select1(const unsigned long long* cand, const int* cnt, int nsplit, int cap, const int* ks, const int* ke, int M, int N, int K,
+                int* out, int* flag, int* fbc, int* done, float* scratch, const void* q, const void* kc, const float* sc, const float* w,
+                int* nfb, hipStream_t st) {
+    if (nsplit > 16 || nsplit < 1) return -5;
+    select_kernel<32><<<FMT_CDIV(M, 4), 256, 0, st>>>(cand, cnt, nsplit, cap, ks, ke, M, N, K, out, flag, fbc);
+    fallback1_kernel<<<64, 256, 0, st>>>(flag, fbc, done, ks, ke, M, N, K, out, scratch, (fp8p)q, (fp8p)kc, sc, w, nfb);
     return (int)hipGetLastError();
 }
 

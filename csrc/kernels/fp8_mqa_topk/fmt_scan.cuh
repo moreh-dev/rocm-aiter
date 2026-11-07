@@ -21,6 +21,7 @@
 // Build flags: -fno-honor-nans -fno-slp-vectorize -mllvm -disable-machine-sink (see fp8_mqa_logits.cu).
 #pragma once
 #include "fmt_common.cuh"
+#include "fmt_select.cuh"
 #ifndef FMT_EMIT_V1
 #define FMT_EMIT_V1 0   // 1 = Nam's v48 emission (per-lane tau / window VGPRs)
 #endif
@@ -29,10 +30,11 @@ namespace fmt {
 
 constexpr int MODE_DENSE = 0;
 constexpr int MODE_EMIT = 1;
+constexpr int MODE_SAMPLE = 2;   // DENSE + STRIDED sample pass + tau of every row in the tail (SplitN must be 1)
 
 #define FMT_SYNC_TILE() __syncthreads()
 
-template <int NUM_WARPS, int SUB, int PF, int MODE, bool STRIDED, bool REVERSE_ROWS>
+template <int NUM_WARPS, int SUB, int PF, int MODE, bool REVERSE_ROWS>
 __global__ __launch_bounds__(NUM_WARPS * WARP)
 void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const float* __restrict__ kv_scale_ptr,
                  const float* __restrict__ W_ptr, const int* __restrict__ ks_ptr, const int* __restrict__ ke_ptr,
@@ -41,7 +43,9 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
                  float* __restrict__ out_ptr, int out_cols, int S,
                  // MODE_EMIT
                  const float* __restrict__ tau_ptr, unsigned long long* __restrict__ cand_ptr, int* __restrict__ cnt_ptr,
-                 int CAP)
+                 int CAP,
+                 // MODE_SAMPLE: tau of every row (target from Ktop), fallback counter reset
+                 float* __restrict__ tau_out_ptr, int Ktop, int* __restrict__ fbc_reset)
 {
     constexpr int BLOCK_M    = 4;
     constexpr int ROWS_WG    = BLOCK_M * NUM_WARPS;
@@ -54,7 +58,7 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     constexpr int STAGES     = 2;
     constexpr int NACC       = 16;
     constexpr bool EMIT      = (MODE == MODE_EMIT);
-    static_assert(!(EMIT && STRIDED), "the sample pass is dense");
+    constexpr bool STRIDED   = (MODE == MODE_SAMPLE);
     using VecOutMFMA = __attribute__((__vector_size__(NACC * sizeof(float)))) float;
 
     __shared__ __attribute__((aligned(16))) fp8   k_lds[STAGES][STAGE_BYTES];
@@ -70,6 +74,9 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     const int m0   = m0wg + warp * BLOCK_M;
     const int pid_split = blockIdx.y;
     if (m0wg >= M) return;
+    if constexpr (MODE == MODE_SAMPLE) {
+        if (blockIdx.x == 0 && blockIdx.y == 0 && tid == 0) *fbc_reset = 0;   // fallback list of this call
+    }
 
     // token space of the pipeline: keys (N) or sample indices (Ns = ceil(N / S))
     const int NT = STRIDED ? FMT_CDIV(N, S) : N;
@@ -131,6 +138,10 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
         if constexpr (EMIT) {
             if (l == 0)
                 for (int r = 0; r < BLOCK_M; ++r) if (m0 + r < M) cnt_ptr[(int64_t)pid_split * M + m0 + r] = 0;
+        }
+        if constexpr (MODE == MODE_SAMPLE) {
+            if (l == 0)
+                for (int r = 0; r < BLOCK_M; ++r) if (m0 + r < M) tau_out_ptr[m0 + r] = -__builtin_huge_valf();
         }
         return;
     }
@@ -468,6 +479,30 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     wait_vmcnt<0>();   // no asm prefetch load may still be in flight when the next pipeline reuses its VGPRs
     run_pipeline(std::false_type{}, cb, ce);
     wait_vmcnt<0>();
+    if constexpr (MODE == MODE_SAMPLE) {
+        if (Ktop <= 0) return;   // debug: sample pass only
+        // tau of my 4 rows from the samples this wave just stored (coherent re-reads); k_lds is free after the barrier
+        __syncthreads();
+        uint32_t* hist = reinterpret_cast<uint32_t*>(&k_lds[0][0]) + warp * 256;
+        float t4[4];
+#ifndef FMT_TAU_DEBUG
+#define FMT_TAU_DEBUG 0
+#endif
+#if FMT_TAU_DEBUG == 1
+        t4[0] = t4[1] = t4[2] = t4[3] = -__builtin_huge_valf();
+#elif FMT_TAU_DEBUG == 2
+        { float acc = 0.f; const float* r0 = out_ptr + (int64_t)m0 * out_cols;
+          #pragma unroll
+          for (int j = 0; j < 64; ++j) acc += r0[min(j * WARP + l, 4 * out_cols - 1)];
+          t4[0] = t4[1] = t4[2] = t4[3] = (acc == 12345.f) ? 0.f : -__builtin_huge_valf(); }
+#else
+        wave_tau4<false>(out_ptr, out_cols, NT, S, m0, M, N, ks_ptr, ke_ptr, Ktop, CAP, hist, l, t4);   // same-CU RAW after vmcnt(0): coherent
+#endif
+        if (l == 0) {
+            #pragma unroll
+            for (int r = 0; r < BLOCK_M; ++r) if (m0 + r < M) tau_out_ptr[m0 + r] = t4[r];
+        }
+    }
     if constexpr (EMIT) {
         if (l == 0) {
             #pragma unroll

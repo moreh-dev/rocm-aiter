@@ -17,6 +17,9 @@ PATHS = {
     "hi16u": lambda: F.Hi16U(),
     "fuse48": lambda: F.Fuse48(),
     "step0": lambda: S.Step0(),
+    "step1": lambda: S.Step1(),
+    "step0s32": lambda: S.Step0(S=32),
+    "step1s32": lambda: S.Step1(S=32),
 }
 
 
