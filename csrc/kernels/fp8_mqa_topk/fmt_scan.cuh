@@ -323,7 +323,18 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     float pd_P0 = 0.f, pd_P1 = 0.f, pd_p2 = 0.f, pd_e3 = 0.f, pd_o3 = 0.f;
     int pd_tok = 0;
     auto dummy_store = [&]() { __builtin_amdgcn_raw_buffer_store_b32(0u, o_rsrc[0], OOB_VOFF, 0, 0); };
-#define FLUSH_PEND() { pair_finish(0, pd_P0, pd_P1, Bo[1].scale, pd_tok, MK{}); \
+    // drain: wait for the clamped, never-used inline-asm prefetches before their VGPRs can be reused (see the same
+    // macro in fmt_fused.cuh; tools/asmloadwaw.py)
+    static_assert(CPL == 1, "drain operand list assumes one chunk per lane");
+    auto drain_prefetch = [&]() {
+        if constexpr (PF == 4)
+            asm volatile("s_waitcnt vmcnt(0)" :: "v"(pf_reg0[0]), "v"(pf_reg1[0]), "v"(pf_reg2[0]), "v"(pf_reg3[0]),
+                         "v"(pf_sc0), "v"(pf_sc1), "v"(pf_sc2), "v"(pf_sc3) : "memory");
+        else
+            asm volatile("s_waitcnt vmcnt(0)" :: "v"(pf_reg0[0]), "v"(pf_reg1[0]), "v"(pf_sc0), "v"(pf_sc1) : "memory");
+    };
+#define FLUSH_PEND() { drain_prefetch(); \
+                       pair_finish(0, pd_P0, pd_P1, Bo[1].scale, pd_tok, MK{}); \
                        pair_store(2, pd_p2, pd_e3 + pd_o3, Bo[1].scale, pd_tok, MK{}, IC<2>{}); }
     // prologue: stages t..t+PF-1 in register slots; stage t -> LDS stage 0; row 0 of sub-tile 0 -> acc[0]
     issue_loads(tb, IC<0>{});

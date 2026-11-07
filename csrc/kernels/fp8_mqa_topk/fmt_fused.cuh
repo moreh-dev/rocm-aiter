@@ -41,7 +41,8 @@ struct FusedArgs {
     int* ctr;                       // PERSIST: [0] claim, [1] items-done barrier, [2] fallback claim, [3] exit
     float* fscratch;                // PERSIST: [G][N] per-WG fallback row
     int* nfb;                       // optional: fallback rows counter (stats)
-    int dbg;                        // bit 0: tau = +inf (forces every non-empty row through the exact fallback)
+    int dbg;                        // bit 0: tau = +inf (forces every non-empty row through the exact fallback);
+                                    // bit 2: tau = -inf (debug: emit every valid key)
 #ifdef FMT_TS
     long long* ts;                  // debug probe: [bx][s][8] s_memrealtime at phase ends (wave 0)
 #endif
@@ -318,7 +319,13 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
         float pd_P0 = 0.f, pd_P1 = 0.f, pd_p2 = 0.f, pd_e3 = 0.f, pd_o3 = 0.f;
         int pd_tok = 0;
         auto dummy_store = [&]() { __builtin_amdgcn_raw_buffer_store_b32(0u, o_rsrc[0], 0x40800000u, 0, 0); };
-#define FLUSH_PEND() { pair_finish(0, pd_P0, pd_P1, Bo[1].scale, pd_tok, MK{}); \
+// Drain: the last stages' clamped prefetches are inline-asm loads whose results are never used, so the compiler
+// treats their destination VGPRs as free at once - but the hardware writes them when the data arrives. Without this
+// wait + use, the late data overwrote a deferred-tail register of the scale-producer wave (ISA: buffer_load_dword v1
+// ... then v_add_f32 v1 before any covering vmcnt): lost / misdirected candidates of the last sub-tile, ~1 % of
+// launches on the partial row block (tools/asmloadwaw.py checks the ISA).
+#define FLUSH_PEND() { asm volatile("s_waitcnt vmcnt(0)" :: "v"(pf_reg0), "v"(pf_reg1), "v"(pf_sc0), "v"(pf_sc1) : "memory"); \
+                   pair_finish(0, pd_P0, pd_P1, Bo[1].scale, pd_tok, MK{}); \
                    pair_store(2, pd_p2, pd_e3 + pd_o3, Bo[1].scale, pd_tok, MK{}, IC<2>{}); }
         issue_loads(tb, IC<0>{});
         issue_loads(min(tb + 1, te - 1), IC<1>{});
@@ -446,6 +453,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
                                 ns, kec - ksc, Ktop, hist, l);
             }
             if (A.dbg & 1) t = __builtin_huge_valf();
+            if (A.dbg & 4) t = -__builtin_huge_valf();   // debug: every valid key a candidate (needs CAP >= keys/split)
             t = __builtin_bit_cast(float, __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int, t)));
             if (ok && l == 0) A.tau[m0 + r] = t;
             if (hset == (r & 1)) p_tau[r / 2] = t;   // lanes of row r in its pair
@@ -457,8 +465,10 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
         }
         FMT_TSP(2);
     } else {
-        if (tid == 0)
+        if (tid == 0) {
             while (__hip_atomic_load(&A.tau_ready[bx], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != A.epoch) __builtin_amdgcn_s_sleep(FMT_SPIN_SLEEP);
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");   // the observing lane synchronizes-with the release
+        }
         FMT_TSP(2);
         __syncthreads();
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -567,9 +577,12 @@ void fused_kernel(FusedArgs A)
             fused_item_call<FUSE_SELECT>(A, A.rb - 1 - item % A.rb, item / A.rb, wg);
         }
         // ---- every item done (global barrier: all G WGs are resident, 1 per CU) -> drain the fallback list ----
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");   // every wave's fallback-list stores complete (do not rely
+        __syncthreads();                                    // on the wait at the return of the noinline item call)
         if (tid == 0) {
             __hip_atomic_fetch_add(&A.ctr[1], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
             while (__hip_atomic_load(&A.ctr[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < G) __builtin_amdgcn_s_sleep(FMT_SPIN_SLEEP);
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         }
         __syncthreads();
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");

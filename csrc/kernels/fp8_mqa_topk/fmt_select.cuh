@@ -372,7 +372,9 @@ __device__ __forceinline__ float wave_tau_ld(LD&& ld, int ns, int nvalid, int K,
     if (ns <= 8 * WARP) return wave_tau_ld_regs<8>(ld, ns, target, hist, lane);
     if (ns <= 16 * WARP) return wave_tau_ld_regs<16>(ld, ns, target, hist, lane);
     if (ns <= 32 * WARP) return wave_tau_ld_regs<32>(ld, ns, target, hist, lane);
+#ifndef FMT_NO_TAU_STREAM
     if (target <= 16 * TAU_STREAM_T) return wave_tau_stream<TAU_STREAM_T, TAU_STREAM_B>(ld, ns, target, hist, lane);
+#endif
     constexpr int RT = 32;
     uint32_t rk[RT];
     #pragma unroll

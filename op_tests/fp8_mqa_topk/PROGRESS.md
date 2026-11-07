@@ -179,25 +179,28 @@ Gates on every build: `scratch` of the fused kernels only outside the hand-vmcnt
 increasing, 1024 x 196608 increasing, forced fallback, poisoned workspaces), `repeat_check.py 2|3|4` (30 back-to-back
 launches over 3 alternating shapes: self-resetting counters and epochs).
 
-### Results (1 layer, top-512, ms; `results/bench_steps_128k_final.json`, 3 rounds)
+### Results (1 layer, top-512, ms; `results/bench_steps_128k_fixed.json`, 3 rounds, after the race fix below)
 
 ISL 128,000 (8 chunks):
 
 | baseu | hi16u | fuse48 | step 0 | step 1 | **step 2** | step 3 | step 4 |
 |---|---|---|---|---|---|---|---|
-| 10.912 | 8.986 (-17.7 %) | 10.200 (-6.5 %) | 8.587 (-21.3 %) | 8.658 (-20.7 %) | **8.333 (-23.6 %)** | 8.563 (-21.5 %) | 9.450 (-13.4 %) |
+| 10.924 | 9.007 (-17.5 %) | 10.187 (-6.7 %) | 8.578 (-21.5 %) | 8.651 (-20.8 %) | **8.337 (-23.7 %)** | 8.581 (-21.4 %) | 9.416 (-13.8 %) |
 
-Per chunk, step 3 - step 2 = +15-45 us (+64 us on the 3-split 13312 x 32000 chunk); step 4 - step 3 = +77-165 us.
-0 wrong rows and 0 fallback rows on every chunk; ~1.4K candidates per row (max ~2.4K).
+Per chunk, step 3 - step 2 = +14-44 us (+68 us on the 3-split 13312 x 32000 chunk); step 4 - step 3 = +79-141 us.
+(The pre-fix run, `results/bench_steps_128k_final.json`, is the same within noise: step 2 8.333, step 3 8.563, step 4
+9.450 ms.)
+0 wrong rows and 0 fallback rows on every chunk. Steps 2-4: 1.16-1.44K candidates per row on average (max 2457);
+steps 0/1 emit every key of a row with <= CAP = 4096 valid keys (tau = -inf on the 16384 x 4096 chunk).
 
-Long context and small M (`results/bench_long_shapes_final.json`):
+Long context and small M (`results/bench_long_shapes_fixed.json`):
 
 | chunk (SplitN) | baseu | hi16u | step 0 | step 2 | step 3 | step 4 |
 |---|---|---|---|---|---|---|
-| 16384 x 65536 (1) | 4.856 | 4.132 | 3.656 | **3.631** | 3.647 | 3.921 |
-| 16384 x 262144 (1) | 19.073 | 18.270 | **14.137** | 14.358 | 14.336 | 15.295 |
-| 2048 x 131072 (4) | 1.339 | 1.156 | **0.974** | 1.041 | 1.096 | 1.209 |
-| 576 x 250000 (14) | 0.763 | 0.671 | **0.563** | 0.738 | 0.797 | 0.906 |
+| 16384 x 65536 (1) | 4.841 | 4.136 | 3.654 | **3.642** | 3.656 | 3.896 |
+| 16384 x 262144 (1) | 19.081 | 19.094 | **14.107** | 14.328 | 14.363 | 15.154 |
+| 2048 x 131072 (4) | 1.339 | 1.162 | **0.973** | 1.045 | 1.104 | 1.205 |
+| 576 x 250000 (14) | 0.788 | 0.682 | **0.565** | 0.741 | 0.801 | 0.905 |
 
 ### Why step 3 and step 4 are not faster (measured)
 
@@ -207,7 +210,8 @@ Long context and small M (`results/bench_long_shapes_final.json`):
   select cannot be inlined (that spilled inside the hand-vmcnt pipelines, which gives wrong results, see step 0). Behind
   a call it pays the call frame (316 B/lane scratch) and runs on the 4 rows of each wave in turn. Probe: 61-69 us per
   32-row block at every N, i.e. 122-138 us per CU per chunk. The standalone `select_kernel<32>` (204 VGPR, no
-  frame) does the same rows in less time: step 3 - step 2 = +15-45 us per 16384-row chunk. At 16384 x 4096 the in-kernel select (61 us) costs more than the block's whole
+  frame) does the same rows in less time: step 3 - step 2 = +14-44 us per 16384-row chunk of the 128K run (equal
+  within noise at 64K and 262K pools). At 16384 x 4096 the in-kernel select (61 us) costs more than the block's whole
   EMIT scan (55 us).
 * **Persistence has nothing to win and costs per item.**
   * Static dispatch with the makespan model is already at the work/256 bound for full chunks.
@@ -218,15 +222,15 @@ Long context and small M (`results/bench_long_shapes_final.json`):
     loops are the same (19.0 vs 18.875 VALU/MFMA).
 * **Few row blocks, long rows (SplitN > 1):** split 0 samples the whole row (1/S of a full-row scan = SplitN/S of a
   split's work) and computes tau while the other splits wait. At 576 x 250000 (14 splits) that is 175 + 66 us before
-  a 482 us EMIT, so step 2 is 0.738 vs 0.563 ms for step 0 (separate sample + tau kernels spread over all CUs). At
+  a 482 us EMIT, so step 2 is 0.741 vs 0.565 ms for step 0 (separate sample + tau kernels spread over all CUs). At
   SplitN = 4 (2048 x 131072): +7 %; at SplitN <= 3: within 0-1 %.
 
 ### Status vs the goal
 
-* Step 4 (one launch, exact) is implemented, but it is **not** faster. 9.45 ms at 128K: -13.4 % vs baseu, behind
+* Step 4 (one launch, exact) is implemented, but it is **not** faster. 9.42 ms at 128K: -13.8 % vs baseu, behind
   hi16u, step 0 and steps 1-3. The reasons are above, and none of them is a missing optimization of the persistent
   loop.
-* **Best path: step 2** (3 launches), 8.33 ms at 128K: -23.6 % vs baseu, -7.3 % vs hi16u. It also wins at 64K pools.
+* **Best path: step 2** (3 launches), 8.34 ms at 128K: -23.7 % vs baseu, -7.4 % vs hi16u. It also wins at 64K pools.
   Step 0 is 1.6 % faster at 262K pools and leads on small-M chunks (SplitN >= 4).
 * A single launch at step-3 speed is possible without persistence: the selecting WG recomputes its rare failing rows
   itself. That only removes the free `fallback1` launch, so it was not built.
@@ -235,3 +239,53 @@ Long context and small M (`results/bench_long_shapes_final.json`):
      claimed with epoch-valued flags (work stealing, so nothing assumes co-residency); the last finisher computes
      tau. Expected: 576 x 250000 0.74 -> ~0.52 ms.
   2. A faster in-kernel select (2 rows per wave in flight, no call frame) is the only lever left for step 3/4.
+
+## 2026-11-07 - intermittent step-2 race: inline-asm prefetch registers reused before the load landed (fixed)
+
+* **Found:** after the review hardening (acquire fence after the polls, explicit wait before the persistent barrier)
+  one quick-test case failed once: step 2, (1000, 3000, rand, causal), SplitN 8, 2 wrong rows, 0 fallback rows.
+  Repeating: step 2 failed 1 of 6 quick suites; `repro_flaky.py` (fresh workspace per launch, poisoned) 16 of 300
+  launches (0.7-5 % across runs); steps 3 and 4 0 of 300. So the earlier "all tests exact" held for each run of the
+  suite, but step 2 had a ~1 % intermittent failure on this shape.
+* **Where:** always row block 31 (the only partial block: its whole range runs through the multi-stage masked
+  pipeline), wave 0 (the only wave issuing the inline-asm scale loads), the last 32-token sub-tile of a pipeline run
+  (split 7, once split 0's EMIT). Three symptoms: that sub-tile's candidate slots still poisoned while the count was
+  right; records of another split's key range in the segment; the sub-tile's upper-row candidates not counted.
+  `repro_fused.py` (fused kernel alone, finite tau): 4 of 600 launches; with tau = -inf (every key stored) 0 of 400.
+* **Ruled out, each by experiment:**
+  * The 8 B spill: built without it (`-DFMT_NO_TAU_STREAM`), still failing.
+  * The poison fill: it runs on the same stream, and the failures persist with a sync after it and without poison.
+  * A descriptor-SGPR WAR after the last store: waiting before the reloads did not fix it.
+  * VALU-SGPR -> VMEM hazards: the new CFG-aware `tools/sgprhaz2.py` reports 0.
+  * Permlane hazards: 0.
+  * Unexpected VMEM inside the pipeline regions (`tools/vmemloc.py`): only out-of-line blocks whose loads are waited
+    for immediately.
+* **Cause:** the last stages issue clamped prefetches as inline-asm loads whose results are never used. The compiler
+  treats an asm output as written when the asm statement executes, so it saw the destination VGPR as free and reused
+  it. ISA: `buffer_load_dword v1 ... offen` (the scale prefetch), then `v_add_f32 v1, ...` in the deferred tail, with
+  no covering vmcnt on that path. The hardware writes v1 when the load returns; when that came after the reuse, the
+  scale value replaced a tail value of the scale-producer wave.
+* **Fix:** `FLUSH_PEND` now starts with `asm volatile("s_waitcnt vmcnt(0)" :: "v"(pf_reg0), "v"(pf_reg1),
+  "v"(pf_sc0), "v"(pf_sc1) : "memory")`, in both the fused and the scan kernels. The registers stay allocated to the
+  in-flight loads until they have landed.
+  * New gate `tools/asmloadwaw.py`: walks the CFG from every inline-asm load to the vmcnt that covers it and reports
+    any write to its destination.
+  * Before the fix: 1 hit in each step-2 fused kernel and in every `scan_kernel` mode (EMIT, DENSE, SAMPLE).
+  * After the fix: 0 in every kernel. Register and scratch use are unchanged.
+* **Verified:**
+  * `repro_fused.py` 0 of 1200 and `repro_flaky.py` (full step 2) 0 of 1200, vs 4-16 failures per 300-600 launches
+    before.
+  * `repro_flaky.py` for every step: 0 of 600 on 1000 x 3000 (steps 0-4) and 0 of 400 on 777 x 9000 (steps 2-4).
+  * `test_exact.py --quick` 16/16 for steps 0-4, the full suite 28/28 for step 2, `repeat_check.py 2|3|4` OK.
+  * All ISA gates clean on every kernel: asmloadwaw 0, sgprhaz2 0, permcheck 0, scratch inside pipelines 0.
+  * Timing unchanged (the tables above are post-fix).
+* **The shipped v35wes kernel** (`module_fp8_mqa_logits.so`, from `csrc/kernels/fp8_mqa_logits.cu`) has the same
+  pattern in its `CLEAN_LOGITS = false` instances (NUM_WARPS 8 and 4).
+  * The scale prefetch's destination v1 is set to `OOB_VOFF`, merged into the voffset of the drain's final pair
+    stores (`v_cndmask`), and read by `buffer_store_dword` 2-4 instructions later, before any covering wait (twice).
+  * If the late load lands inside that window, the scale's bit pattern (~1e9 for normal scales) becomes the voffset
+    of every lane of that store. That is beyond num_records (2N*4), so the last sub-tile's logits of one row pair
+    are silently not written.
+  * Not reproduced: sentinel-filled `out=`, 9 shapes, ~4,700 launches (`repro_shipped.py`), 0 in-window differences
+    and 0 stray writes. The window is only a few instructions wide.
+  * The same one-line drain wait fixes it. Not applied here: it is the shipped kernel, outside this task.
