@@ -113,3 +113,4 @@ csrc/opus_gemm/gen_co/*/asm/
 *.orig
 op_tests/fp8_mqa_topk/build/
 op_tests/fp8_mqa_topk/results/*.log
+op_tests/fp8_mqa_topk/.rocprofv3/
