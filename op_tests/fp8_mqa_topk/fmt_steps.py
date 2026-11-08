@@ -9,6 +9,7 @@ import fmt_harness as F
 
 c_int, c_vp = ctypes.c_int, ctypes.c_void_p
 _LIB = None
+SMP_SLACK = 8192   # records: the tau loads read up to B * 64 records past a row's count (masked, not clamped)
 
 
 def lib():
@@ -60,8 +61,11 @@ class Step0:
     EMIT scan (row-wide tau, v35wes split), select + 3 fallback kernels. 7 kernels + 6 torch ops per call."""
     name = "step0"
 
-    def __init__(self, S=16, cap=4096, K=F.TOPK):
+    def __init__(self, S=16, cap=4096, K=F.TOPK, krule=False):
         self.S, self.cap, self.K = S, cap, K
+        # tau = -inf rule: rows with nvalid <= rule get every key as a candidate. Steps 0/1 use CAP; krule=True uses K
+        # (the step 2-4 rule) for a like-for-like comparison.
+        self.rule = K if krule else cap
         self.shape = None
         self.force_fallback = False   # debug: tau = +inf -> no candidates -> every row takes the exact fallback
 
@@ -89,7 +93,7 @@ class Step0:
         ks_s = (ks + (S - 1)) // S
         ke_s = (ke + (S - 1)) // S
         _ck(L.fmt_dense(p(q8), p(k_s), p(sc_s), p(w), p(ks_s), p(ke_s), p(self.ls), M, self.Ns, self.Ns, 0, -1, st), "dense(sample)")
-        _ck(L.fmt_tau(p(self.ls), self.Ns, S, p(ks), p(ke), M, N, self.K, self.cap, p(self.tau), p(self.fbc), st), "tau")
+        _ck(L.fmt_tau(p(self.ls), self.Ns, S, p(ks), p(ke), M, N, self.K, self.rule, p(self.tau), p(self.fbc), st), "tau")
         if self.force_fallback:
             self.tau.fill_(float("inf"))
         _ck(L.fmt_emit(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), p(self.tau), p(self.cand), p(self.cnt), self.cap, M, N,
@@ -117,7 +121,7 @@ class Step1(Step0):
         if self.shape != (M, N):
             self.prep(M, N)
         L, p, st = lib(), F.ptr, F.stream()
-        _ck(L.fmt_sample_tau(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), p(self.ls), M, N, S, self.K, self.cap, p(self.tau),
+        _ck(L.fmt_sample_tau(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), p(self.ls), M, N, S, self.K, self.rule, p(self.tau),
                              p(self.fbc), st), "sample_tau")
         if self.force_fallback:
             self.tau.fill_(float("inf"))
@@ -145,7 +149,7 @@ class Step2:
         self.nsb = lib().fmt_fused_nsb(N, self.split, self.S)
         self.rb = (M + 31) // 32
         Mp = M + (M & 1)
-        self.smp = torch.empty(Mp * self.nsb, dtype=torch.int64, device=d)
+        self.smp = torch.empty(Mp * self.nsb + SMP_SLACK, dtype=torch.int64, device=d)
         self.tau = torch.empty(M, device=d)
         self.tau_ready = torch.zeros(self.rb, dtype=torch.int32, device=d)
         self.epoch = 0
@@ -207,7 +211,7 @@ class Step4(Step2):
     def prep(self, M, N):
         super().prep(M, N)
         d = "cuda"
-        self.smp = torch.empty(self.G * 32 * self.nsb, dtype=torch.int64, device=d)
+        self.smp = torch.empty(self.G * 32 * self.nsb + SMP_SLACK, dtype=torch.int64, device=d)
         self.ctr = torch.zeros(4, dtype=torch.int32, device=d)
         self.fscratch = torch.empty(self.G * N, device=d)
 

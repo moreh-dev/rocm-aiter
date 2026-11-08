@@ -57,6 +57,9 @@ constexpr int FUSED_THREADS = 512;
 // Spin-waits poll with RELAXED agent-scope loads and acquire once (fence after the WG barrier): an acquire load per
 // iteration adds a buffer_inv sc1 (L2 invalidate) per poll, which slowed the producing WGs of a 576 x 250000 chunk
 // (14 splits) from 352 + 251 us (sample + tau) to 175 + 66 us when removed.
+#ifndef FMT_TAU_B
+#define FMT_TAU_B 8   // tau sample loads per row and round (4 rows in lockstep -> 4 * FMT_TAU_B loads in flight)
+#endif
 #ifndef FMT_SPIN_SLEEP
 #define FMT_SPIN_SLEEP 2
 #endif
@@ -100,7 +103,8 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
 
     __shared__ __attribute__((aligned(16))) fp8   k_lds[STAGES][STAGE_BYTES];
     __shared__ __attribute__((aligned(16))) float sc_lds[STAGES][STAGE_TOK];
-    __shared__ uint32_t hist_lds[NUM_WARPS][256];   // tau / select histograms: own LDS (no reuse of the K ring)
+    __shared__ __attribute__((aligned(16))) uint32_t hist_lds[NUM_WARPS][4 * 256];   // tau (4 rows in lockstep) /
+                                                                                     // select histograms (own LDS)
     __shared__ int bcast;
     constexpr int SC_WAVES = STAGE_TOK / WARP;
     static_assert(STAGE_TOK % WARP == 0 && SC_WAVES <= NUM_WARPS, "scale producer mapping");
@@ -440,23 +444,40 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
         }
         wait_vmcnt<0>();
         FMT_TSP(1);
-        #pragma unroll 1
-        for (int r = 0; r < BLOCK_M; ++r) {     // same-wave read-after-write of its own records
-            const int ns = cnt_row[r];
-            cnt_row[r] = 0;
-            float t = -__builtin_huge_valf();
-            int ksc, kec;
-            const bool ok = row_win(r, ksc, kec);
-            if (ok && ns > 0) {
-                const unsigned long long* rec = A.smp + (srow0 + (r & ~1)) * NSB + (r & 1);   // record i at rec[2i]
-                t = wave_tau_ld([&](int i) -> float { return __builtin_bit_cast(float, (unsigned)rec[2 * i]); },
-                                ns, kec - ksc, Ktop, hist, l);
+        {   // tau of the wave's 4 rows in lockstep (same-wave read-after-write of its own records)
+            int ns_r[BLOCK_M], tgt[BLOCK_M];
+            bool act[BLOCK_M], okr[BLOCK_M];
+            #pragma unroll
+            for (int r = 0; r < BLOCK_M; ++r) {
+                int ksc, kec;
+                okr[r] = row_win(r, ksc, kec);
+                ns_r[r] = cnt_row[r];
+                cnt_row[r] = 0;
+                tgt[r] = okr[r] ? tau_target(ns_r[r], kec - ksc, Ktop) : 0;
+                act[r] = tgt[r] > 0 && tgt[r] <= 16 * TAU_STREAM_T;
             }
-            if (A.dbg & 1) t = __builtin_huge_valf();
-            if (A.dbg & 4) t = -__builtin_huge_valf();   // debug: every valid key a candidate (needs CAP >= keys/split)
-            t = __builtin_bit_cast(float, __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int, t)));
-            if (ok && l == 0) A.tau[m0 + r] = t;
-            if (hset == (r & 1)) p_tau[r / 2] = t;   // lanes of row r in its pair
+            float t4[BLOCK_M];
+            const uint32_t* rowp[BLOCK_M];
+            #pragma unroll
+            for (int q = 0; q < BLOCK_M; ++q)   // record i of row q at A.smp[(srow0 + (q & ~1)) * NSB + 2 i + (q & 1)]
+                rowp[q] = reinterpret_cast<const uint32_t*>(A.smp + (srow0 + (q & ~1)) * NSB + (q & 1));
+            wave_tau_multi<BLOCK_M, FMT_TAU_B>(rowp, 0, [&](int q, int) -> int { return ns_r[q]; }, 1, act, tgt, hist, l, t4);
+            #pragma unroll 1
+            for (int r = 0; r < BLOCK_M; ++r) {
+                float t = t4[r];
+                if (tgt[r] > 16 * TAU_STREAM_T) {   // target beyond the per-lane filter's range (not hit at S = 32)
+                    int ksc, kec;
+                    row_win(r, ksc, kec);
+                    const unsigned long long* rec = A.smp + (srow0 + (r & ~1)) * NSB + (r & 1);
+                    t = wave_tau_ld([&](int i) -> float { return __builtin_bit_cast(float, (unsigned)rec[2 * i]); },
+                                    ns_r[r], kec - ksc, Ktop, hist, l);
+                }
+                if (A.dbg & 1) t = __builtin_huge_valf();
+                if (A.dbg & 4) t = -__builtin_huge_valf();   // debug: every valid key a candidate (needs CAP >= keys/split)
+                t = __builtin_bit_cast(float, __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int, t)));
+                if (okr[r] && l == 0) A.tau[m0 + r] = t;
+                if (hset == (r & 1)) p_tau[r / 2] = t;   // lanes of row r in its pair
+            }
         }
         if (SplitN > 1) {
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");

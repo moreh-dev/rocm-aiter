@@ -1,0 +1,95 @@
+{
+ "args": {
+  "isl": "8192,60000,128000",
+  "shapes": "32768x65536",
+  "paths": "baseu,hi16u,step0s32,step1s32,step2,step3,step4",
+  "kind": "rand",
+  "reqs": 1,
+  "iters": 5,
+  "rounds": 2,
+  "no_check": false,
+  "out": "results/bench_32768x65536.json"
+ },
+ "chunks": {
+  "32768x65536": {
+   "M": 32768,
+   "N": 65536,
+   "ms": {
+    "baseu": 9.393112659454346,
+    "hi16u": 7.9119439125061035,
+    "step0s32": 6.99351954460144,
+    "step1s32": 7.083380460739136,
+    "step2": 6.982879638671875,
+    "step3": 6.993719577789307,
+    "step4": 7.413941383361816
+   },
+   "info": {
+    "baseu": {
+     "wrong": 0
+    },
+    "hi16u": {
+     "wrong": 0
+    },
+    "step0s32": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1423.826904296875,
+     "cand_max": 2453,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step1s32": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1423.826904296875,
+     "cand_max": 2453,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1423.826904296875,
+     "cand_max": 2453,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step3": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1423.826904296875,
+     "cand_max": 2453,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step4": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1423.826904296875,
+     "cand_max": 2453,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  }
+ },
+ "isl": {
+  "32768x65536": {
+   "chunks": [
+    [
+     32768,
+     65536
+    ]
+   ],
+   "ms": {
+    "baseu": 9.393112659454346,
+    "hi16u": 7.9119439125061035,
+    "step0s32": 6.99351954460144,
+    "step1s32": 7.083380460739136,
+    "step2": 6.982879638671875,
+    "step3": 6.993719577789307,
+    "step4": 7.413941383361816
+   }
+  }
+ }
+}

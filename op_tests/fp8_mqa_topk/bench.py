@@ -19,6 +19,7 @@ PATHS = {
     "step0": lambda: S.Step0(),
     "step1": lambda: S.Step1(),
     "step0s32": lambda: S.Step0(S=32),
+    "step0ks32": lambda: S.Step0(S=32, krule=True),   # step 0 with the step 2-4 tau = -inf rule (nvalid <= K)
     "step1s32": lambda: S.Step1(S=32),
     "step2": lambda: S.Step2(S=32),
     "step3": lambda: S.Step3(S=32),

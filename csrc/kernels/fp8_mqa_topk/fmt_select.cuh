@@ -20,16 +20,33 @@ namespace fmt {
 
 // ------------------------------------------------------------------------------------------------- wave helpers
 // wave-level: bin b of hist[256] with above(b) < target <= above(b) + h[b]
+// inclusive prefix sum over the wave with DPP (row_shr 1/2/4/8 inside each 16-lane row, then row_bcast 15 / 31 across
+// rows; gfx9). VALU only - replaces a chain of 6 dependent ds_bpermute (__shfl_up) round trips.
+__device__ __forceinline__ int wave_incl_scan_dpp(int x) {
+    x += __builtin_amdgcn_update_dpp(0, x, 0x111, 0xf, 0xf, false);   // row_shr:1
+    x += __builtin_amdgcn_update_dpp(0, x, 0x112, 0xf, 0xf, false);   // row_shr:2
+    x += __builtin_amdgcn_update_dpp(0, x, 0x114, 0xf, 0xf, false);   // row_shr:4
+    x += __builtin_amdgcn_update_dpp(0, x, 0x118, 0xf, 0xf, false);   // row_shr:8
+    x += __builtin_amdgcn_update_dpp(0, x, 0x142, 0xa, 0xf, false);   // row_bcast:15 into rows 1, 3
+    x += __builtin_amdgcn_update_dpp(0, x, 0x143, 0xc, 0xf, false);   // row_bcast:31 into rows 2, 3
+    return x;
+}
+// bin of the target-th largest key in a 256-bin histogram (lane l owns bins 4l..4l+3); fab = keys in higher bins,
+// fcnt = keys in the bin. One ds_read_b128 per lane, DPP scan, readlane broadcasts (hist 16-byte aligned).
 __device__ __forceinline__ void wave_find256(const uint32_t* hist, int target, int lane, int& fbin, int& fab, int& fcnt) {
     const int lo = lane * 4;
-    int s4 = 0;
-    for (int b = lo; b < lo + 4; ++b) s4 += hist[b];
-    const int incl = wave_incl_scan(s4, lane);
-    int cum = __shfl(incl, WARP - 1) - incl, fb = -1, fa = 0, fc = 0;
-    for (int b = lo + 3; b >= lo; --b) { const int h = hist[b]; if (cum < target && cum + h >= target) { fb = b; fa = cum; fc = h; } cum += h; }
+    const u32x4 h4 = *reinterpret_cast<const u32x4*>(&hist[lo]);
+    const int incl = wave_incl_scan_dpp((int)(h4[0] + h4[1] + h4[2] + h4[3]));
+    int cum = __builtin_amdgcn_readlane(incl, WARP - 1) - incl, fb = -1, fa = 0, fc = 0;
+    #pragma unroll
+    for (int k = 3; k >= 0; --k) {
+        const int h = (int)h4[k];
+        if (cum < target && cum + h >= target) { fb = lo + k; fa = cum; fc = h; }
+        cum += h;
+    }
     const uint64_t bm = __ballot(fb >= 0);
     const int src = bm ? __builtin_ctzll(bm) : 0;
-    fbin = __shfl(fb, src); fab = __shfl(fa, src); fcnt = __shfl(fc, src);
+    fbin = __builtin_amdgcn_readlane(fb, src); fab = __builtin_amdgcn_readlane(fa, src); fcnt = __builtin_amdgcn_readlane(fc, src);
 }
 
 // radix over 32-bit keys delivered by each(f) (f(key, col) called per element, non-uniformly) -> key T of rank K
@@ -193,6 +210,133 @@ __device__ __forceinline__ float wave_tau_stream(LD& ld, int ns, int target, uin
     return wave_tau_relradix<T>(top, target, hist, lane);
 }
 constexpr int TAU_STREAM_T = 8, TAU_STREAM_B = 16;
+
+// tau of up to NR rows of one wave in LOCKSTEP, so their load and LDS latency chains overlap (4 rows one after another
+// were latency-bound: 29 us per 32-row block at 896 samples/row, 116 us at 8192). Row q: act[q] (false -> -inf),
+// tgt[q] target rank (<= 16 T), samples in nseg segments: cntf(q, g) = wave-uniform count, ld(q, g, i) = value i.
+// 1) every lane keeps its T largest keys per row; segment elements are dealt to lanes round-robin over the
+//    concatenation (lane = (prefix + i) % 64), so lanes stay balanced and a row with <= 64 T samples keeps them all;
+//    the kept keys are a subset of the samples, so the result is <= the exact target-th largest (valid lower bound);
+// 2) the relative two-pass radix of wave_tau_relradix on the NR rows together (LDS: NR x 256 u32 at hist, 16 B aligned).
+// A row whose kept-key count is below its target (cannot happen with balanced dealing) gets tau = -inf (safe).
+template <int NR, int B, typename CNT>
+__device__ __forceinline__ void wave_tau_multi(const uint32_t* const (&rowp)[NR], int64_t seg_stride, CNT&& cntf, int nseg,
+                                               const bool (&act)[NR], const int (&tgt)[NR], uint32_t* hist, int lane,
+                                               float (&tau)[NR]) {
+    // rowp[q]: wave-uniform base of row q's sample records in segment 0 (record i's fp32 bits at rowp[q][4 i], i.e.
+    // u64 records at a 16-byte stride); segment g starts seg_stride u32 later. Loads past a row's count are masked, not
+    // clamped (uniform base + 32-bit lane offset + immediate: one VGPR per row and round), so the record buffer needs
+    // B * 64 records of slack at its end. Inactive rows still need a valid rowp.
+    constexpr int T = TAU_STREAM_T;
+    uint32_t top[NR][T];
+    #pragma unroll
+    for (int q = 0; q < NR; ++q)
+        #pragma unroll
+        for (int t = 0; t < T; ++t) top[q][t] = 0u;
+    int pref[NR];
+    #pragma unroll
+    for (int q = 0; q < NR; ++q) pref[q] = 0;
+    #pragma unroll 1
+    for (int g = 0; g < nseg; ++g) {
+        int n[NR], off[NR], nmax = 0;
+        const uint32_t* sp[NR];
+        #pragma unroll
+        for (int q = 0; q < NR; ++q) {
+            n[q] = act[q] ? cntf(q, g) : 0;
+            off[q] = (lane - pref[q]) & (WARP - 1);          // this lane's first element of the segment
+            nmax = max(nmax, n[q]);
+            sp[q] = rowp[q] + (int64_t)g * seg_stride;
+        }
+        #pragma unroll 1
+        for (int c0 = 0; c0 < nmax; c0 += B * WARP) {         // wave-uniform trip count
+            uint32_t v[NR][B];
+            #pragma unroll
+            for (int q = 0; q < NR; ++q) {
+                const uint32_t* lp = sp[q] + 4 * (c0 + off[q]);
+                #pragma unroll
+                for (int j = 0; j < B; ++j) v[q][j] = lp[4 * j * WARP];
+            }
+            __builtin_amdgcn_sched_barrier(0);                 // keep the round's loads together (in flight at once)
+            #pragma unroll
+            for (int q = 0; q < NR; ++q)
+                #pragma unroll
+                for (int j = 0; j < B; ++j) {
+                    uint32_t x = (c0 + j * WARP + off[q] < n[q]) ? okey32(v[q][j]) : 0u;
+                    #pragma unroll
+                    for (int t = 0; t < T - 1; ++t) { const uint32_t h = max(top[q][t], x); x = min(top[q][t], x); top[q][t] = h; }
+                    top[q][T - 1] = max(top[q][T - 1], x);
+                }
+        }
+        #pragma unroll
+        for (int q = 0; q < NR; ++q) pref[q] += n[q];
+    }
+    // ---- relative two-pass radix, NR rows together ----
+    uint32_t kmax[NR], kmin[NR];
+    int kept[NR];
+    #pragma unroll
+    for (int q = 0; q < NR; ++q) {
+        uint32_t vmax = 0u, vmin = 0xFFFFFFFFu; int nk = 0;
+        #pragma unroll
+        for (int t = 0; t < T; ++t) { const uint32_t k = top[q][t]; vmax = max(vmax, k); vmin = min(vmin, k ? k : 0xFFFFFFFFu); nk += k != 0u; }
+        kmax[q] = wave_max_u32(vmax); kmin[q] = wave_min_u32(vmin); kept[q] = wave_sum_dpp(nk);
+    }
+    int sh1[NR], sh2[NR], a1[NR];
+    uint32_t pre1[NR], Tk[NR];
+    #pragma unroll
+    for (int q = 0; q < NR; ++q) {
+        const uint32_t diff = kmax[q] ^ kmin[q];
+        const int hb = diff ? 31 - __builtin_clz(diff) : 0;
+        sh1[q] = max(hb - 7, 0); sh2[q] = max(sh1[q] - 8, 0);
+        pre1[q] = (sh1[q] + 8 >= 32) ? 0u : (kmax[q] >> (sh1[q] + 8));
+    }
+    auto zero_hist = [&]() {
+        #pragma unroll
+        for (int b = lane * 4; b < NR * 256; b += WARP * 4) *reinterpret_cast<u32x4*>(&hist[b]) = u32x4{0u, 0u, 0u, 0u};
+    };
+    zero_hist();
+    mem_fence_wave();
+    #pragma unroll
+    for (int q = 0; q < NR; ++q)
+        #pragma unroll
+        for (int t = 0; t < T; ++t) { const uint32_t k = top[q][t]; if (k) atomicAdd(&hist[q * 256 + ((k >> sh1[q]) & 255u)], 1u); }
+    mem_fence_wave();
+    #pragma unroll
+    for (int q = 0; q < NR; ++q) {
+        int b1, c1;
+        wave_find256(hist + q * 256, tgt[q], lane, b1, a1[q], c1);
+        Tk[q] = (pre1[q] << 8 | (uint32_t)(b1 & 255)) << sh1[q];
+    }
+    mem_fence_wave();
+    zero_hist();
+    mem_fence_wave();
+    #pragma unroll
+    for (int q = 0; q < NR; ++q) {
+        const uint32_t hiT = Tk[q] >> sh1[q];
+        const uint32_t wmask = (1u << (sh1[q] - sh2[q])) - 1u;
+        #pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const uint32_t k = top[q][t];
+            if (sh1[q] > 0 && k && (k >> sh1[q]) == hiT) atomicAdd(&hist[q * 256 + ((k >> sh2[q]) & wmask)], 1u);
+        }
+    }
+    mem_fence_wave();
+    #pragma unroll
+    for (int q = 0; q < NR; ++q) {
+        int b2, a2, c2;
+        wave_find256(hist + q * 256, tgt[q] - a1[q], lane, b2, a2, c2);
+        const uint32_t Tf = sh1[q] > 0 ? (Tk[q] | ((uint32_t)(b2 & 255) << sh2[q])) : Tk[q];
+        const bool flat = kmax[q] == kmin[q];
+        const uint32_t key = flat ? kmax[q] : Tf;
+        tau[q] = (act[q] && kept[q] >= tgt[q]) ? __builtin_bit_cast(float, okey32_inv(key)) : -__builtin_huge_valf();
+    }
+    mem_fence_wave();
+}
+// target rank of a row's tau from its sample count ns and valid-key count nvalid (steps 2-4 rule); 0 -> tau = -inf
+__device__ __forceinline__ int tau_target(int ns, int nvalid, int K) {
+    const float e = (float)K * (float)ns / (float)max(nvalid, 1);
+    const int target = (int)ceilf(e + 5.f * sqrtf(e)) + 8;
+    return (nvalid <= K || ns < target) ? 0 : target;
+}
 
 // Exact K-th largest of the keys rk (0 = empty slot) by a RELATIVE radix: 8-bit LDS-histogram passes starting just
 // below the common prefix of the row's min / max key; stops as soon as the boundary bin holds exactly the keys still
