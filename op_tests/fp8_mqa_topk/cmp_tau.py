@@ -18,6 +18,8 @@ out = torch.empty(M, F.TOPK, dtype=torch.int32, device="cuda")
 res = {}
 for sp in (1, a.split):
     st = S.Step2(split=sp); st.prep(M, Nt); st.force_fallback = 2
+    if sp > 1:
+        st.dbg_bits = 8 | 16   # the distributed variant (u64 sample records) even when the grid exceeds the GPU
     st.tau.fill_(1.2345e30)
     st(q8, k8, sc, w, ks, ke, out); torch.cuda.synchronize()
     res[sp] = (st.tau.clone(), st)

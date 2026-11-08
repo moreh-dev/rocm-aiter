@@ -43,3 +43,7 @@ if st.split > 1:
 else:
     print(f"  sample {((s0[:,1]-s0[:,0])/100).mean():.1f} us, tau {((s0[:,2]-s0[:,1])/100).mean():.1f} us, "
           f"emit {((s0[:,3]-s0[:,2])/100).mean():.1f} us, select {((s0[:,4]-s0[:,3])/100).mean():.1f} us per block")
+    if (s0[:, 5] > 0).all():   # wave_tau_multi internals (wave 0): streaming / radix pass 1 / radix pass 2 + rest
+        print(f"  tau internals (wave 0): prep+stream {((s0[:,5]-s0[:,1])/100).mean():.1f} us, radix pass 1 "
+              f"{((s0[:,6]-s0[:,5])/100).mean():.1f} us, pass 2 {((s0[:,7]-s0[:,6])/100).mean():.1f} us, after "
+              f"{((s0[:,2]-s0[:,7])/100).mean():.1f} us")

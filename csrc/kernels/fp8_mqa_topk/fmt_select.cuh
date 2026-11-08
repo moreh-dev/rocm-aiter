@@ -236,20 +236,25 @@ constexpr int TAU_STREAM_T = 8, TAU_STREAM_B = 16;
 //    the kept keys are a subset of the samples, so the result is <= the exact target-th largest (valid lower bound);
 // 2) the relative two-pass radix of wave_tau_relradix on the NR rows together (LDS: NR x 256 u32 at hist, 16 B aligned).
 // A row whose kept-key count is below its target (cannot happen with balanced dealing) gets tau = -inf (safe).
-template <int NR, int B, bool BAL = true, typename CNT>
+template <int NR, int B, bool BAL = true, int ESTR = 4, typename CNT>
 __device__ __forceinline__ void wave_tau_multi(const uint32_t* const (&rowp)[NR], int64_t seg_stride, CNT&& cntf, int nseg,
                                                const bool (&act)[NR], const int (&tgt)[NR], uint32_t* hist, int lane,
-                                               float (&tau)[NR], int* dbg_kept = nullptr) {
-    // rowp[q]: wave-uniform base of row q's sample records in segment 0 (record i's fp32 bits at rowp[q][4 i], i.e.
-    // u64 records at a 16-byte stride); segment g starts seg_stride u32 later. Loads past a row's count are masked, not
-    // clamped (uniform base + 32-bit lane offset + immediate: one VGPR per row and round), so the record buffer needs
-    // B * 64 records of slack at its end. Inactive rows still need a valid rowp.
+                                               float (&tau)[NR], int* dbg_kept = nullptr, long long* tsp = nullptr) {
+    // tsp (probe builds): s_memrealtime after streaming [0], after radix pass 1 [1], at the end [2] (lane 0)
+    // rowp[q]: wave-uniform base of row q's samples in segment 0 (value i's fp32 bits at rowp[q][ESTR i]: ESTR 2 =
+    // pair-interleaved 4-byte value slots, 4 = pair-interleaved u64 records); segment g starts seg_stride u32 later.
+    // Loads past a row's count are masked, not clamped (uniform base + 32-bit lane offset + immediate: one VGPR per row
+    // and round), so the sample buffer needs B * 64 samples of slack at its end. Inactive rows still need a valid rowp.
     constexpr int T = TAU_STREAM_T;
-    uint32_t top[NR][T];
+    // per-lane T largest samples per row, kept as FLOATS in descending order (finite logits: float order = key order)
+    // and inserted with one v_med3_f32 per slot - b0 = max(a0, x), bt = med3(a(t-1), at, x) - instead of a
+    // 2T-1-step max/min chain on order keys plus a key conversion per sample (~20 -> ~10 VALU per sample, no chain).
+    // med3 / max return one of their inputs, so the kept values stay a sub-multiset of the samples.
+    float topf[NR][T];
     #pragma unroll
     for (int q = 0; q < NR; ++q)
         #pragma unroll
-        for (int t = 0; t < T; ++t) top[q][t] = 0u;
+        for (int t = 0; t < T; ++t) topf[q][t] = -__builtin_huge_valf();
     int pref[NR];
     #pragma unroll
     for (int q = 0; q < NR; ++q) pref[q] = 0;
@@ -269,24 +274,34 @@ __device__ __forceinline__ void wave_tau_multi(const uint32_t* const (&rowp)[NR]
             uint32_t v[NR][B];
             #pragma unroll
             for (int q = 0; q < NR; ++q) {
-                const uint32_t* lp = sp[q] + 4 * (c0 + off[q]);
+                const uint32_t* lp = sp[q] + ESTR * (c0 + off[q]);   // value i at [ESTR i]: 2 = value slots, 4 = u64 records
                 #pragma unroll
-                for (int j = 0; j < B; ++j) v[q][j] = lp[4 * j * WARP];
+                for (int j = 0; j < B; ++j) v[q][j] = lp[ESTR * j * WARP];
             }
             __builtin_amdgcn_sched_barrier(0);                 // keep the round's loads together (in flight at once)
             #pragma unroll
             for (int q = 0; q < NR; ++q)
                 #pragma unroll
                 for (int j = 0; j < B; ++j) {
-                    uint32_t x = (c0 + j * WARP + off[q] < n[q]) ? okey32(v[q][j]) : 0u;
+                    const float x = (c0 + j * WARP + off[q] < n[q]) ? __builtin_bit_cast(float, v[q][j]) : -__builtin_huge_valf();
+                    float nb[T];
+                    nb[0] = __builtin_fmaxf(topf[q][0], x);
                     #pragma unroll
-                    for (int t = 0; t < T - 1; ++t) { const uint32_t h = max(top[q][t], x); x = min(top[q][t], x); top[q][t] = h; }
-                    top[q][T - 1] = max(top[q][T - 1], x);
+                    for (int t = 1; t < T; ++t) nb[t] = __builtin_amdgcn_fmed3f(topf[q][t - 1], topf[q][t], x);
+                    #pragma unroll
+                    for (int t = 0; t < T; ++t) topf[q][t] = nb[t];
                 }
         }
         #pragma unroll
         for (int q = 0; q < NR; ++q) pref[q] += n[q];
     }
+    if (tsp && lane == 0) tsp[0] = (long long)__builtin_amdgcn_s_memrealtime();
+    uint32_t top[NR][T];   // order keys of the kept samples (0 = empty slot)
+    #pragma unroll
+    for (int q = 0; q < NR; ++q)
+        #pragma unroll
+        for (int t = 0; t < T; ++t)
+            top[q][t] = topf[q][t] == -__builtin_huge_valf() ? 0u : okey32(__builtin_bit_cast(uint32_t, topf[q][t]));
     // ---- relative two-pass radix, NR rows together ----
     uint32_t kmax[NR], kmin[NR];
     int kept[NR];
@@ -323,6 +338,7 @@ __device__ __forceinline__ void wave_tau_multi(const uint32_t* const (&rowp)[NR]
         wave_find256<true>(hist + q * 256, tgt[q], lane, b1, a1[q], c1);
         Tk[q] = (pre1[q] << 8 | (uint32_t)(b1 & 255)) << sh1[q];
     }
+    if (tsp && lane == 0) tsp[1] = (long long)__builtin_amdgcn_s_memrealtime();
     mem_fence_wave();
     zero_hist();
     mem_fence_wave();
@@ -348,6 +364,7 @@ __device__ __forceinline__ void wave_tau_multi(const uint32_t* const (&rowp)[NR]
         if (dbg_kept) dbg_kept[q] = kept[q];
     }
     mem_fence_wave();
+    if (tsp && lane == 0) tsp[2] = (long long)__builtin_amdgcn_s_memrealtime();
 }
 // target rank of a row's tau from its sample count ns and valid-key count nvalid (steps 2-4 rule); 0 -> tau = -inf
 __device__ __forceinline__ int tau_target(int ns, int nvalid, int K) {

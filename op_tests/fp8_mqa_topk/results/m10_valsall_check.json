@@ -1,0 +1,131 @@
+{
+ "args": {
+  "isl": "8192,60000,128000",
+  "shapes": "16384x4096,16384x8192,16384x12288",
+  "paths": "step0ks32,step2",
+  "kind": "rand",
+  "reqs": 1,
+  "iters": 10,
+  "rounds": 3,
+  "no_check": false,
+  "out": "results/m10_valsall_check.json"
+ },
+ "chunks": {
+  "16384x4096": {
+   "M": 16384,
+   "N": 4096,
+   "ms": {
+    "step0ks32": 0.3013615012168884,
+    "step2": 0.27816200256347656
+   },
+   "info": {
+    "step0ks32": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1160.7833251953125,
+     "cand_max": 1933,
+     "tau_ninf": 5631,
+     "fallback_rows": 0
+    },
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1160.7833251953125,
+     "cand_max": 1933,
+     "tau_ninf": 5631,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x8192": {
+   "M": 16384,
+   "N": 8192,
+   "ms": {
+    "step0ks32": 0.5429229736328125,
+    "step2": 0.5143629908561707
+   },
+   "info": {
+    "step0ks32": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1416.960693359375,
+     "cand_max": 2260,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1416.960693359375,
+     "cand_max": 2260,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  },
+  "16384x12288": {
+   "M": 16384,
+   "N": 12288,
+   "ms": {
+    "step0ks32": 0.7621245086193085,
+    "step2": 0.7332839965820312
+   },
+   "info": {
+    "step0ks32": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1422.0390625,
+     "cand_max": 2223,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    },
+    "step2": {
+     "wrong": 0,
+     "split": 1,
+     "cand_mean": 1422.0390625,
+     "cand_max": 2223,
+     "tau_ninf": 0,
+     "fallback_rows": 0
+    }
+   }
+  }
+ },
+ "isl": {
+  "16384x4096": {
+   "chunks": [
+    [
+     16384,
+     4096
+    ]
+   ],
+   "ms": {
+    "step0ks32": 0.3013615012168884,
+    "step2": 0.27816200256347656
+   }
+  },
+  "16384x8192": {
+   "chunks": [
+    [
+     16384,
+     8192
+    ]
+   ],
+   "ms": {
+    "step0ks32": 0.5429229736328125,
+    "step2": 0.5143629908561707
+   }
+  },
+  "16384x12288": {
+   "chunks": [
+    [
+     16384,
+     12288
+    ]
+   ],
+   "ms": {
+    "step0ks32": 0.7621245086193085,
+    "step2": 0.7332839965820312
+   }
+  }
+ }
+}

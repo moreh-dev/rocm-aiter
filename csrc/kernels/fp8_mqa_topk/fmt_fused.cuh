@@ -28,8 +28,10 @@ namespace fmt {
 struct FusedArgs {
     const fp8* Q; const fp8* K; const float* kv_scale; const float* W; const int* ks; const int* ke;
     int M, N, SplitN, S, Ktop, CAP, NSB, rb;
-    unsigned long long* smp;        // sample records (fp32 | idx << 32), interleaved pair segments of 2*NSB: rows
-                                    // m (grid, split 0 only) or slot*32 + (m - m0wg) (persistent, per-WG slot)
+    unsigned long long* smp;        // samples. Plain grid variant: fp32 values only, pair-interleaved 4-byte slots
+                                    // (row pair m, m+1 at u32 m*NSB, 2*NSB slots; split 0 only). Distributed: u64
+                                    // records (fp32 | idx << 32) per chunk segment. Persistent: u64 records in
+                                    // interleaved pair segments of 2*NSB, rows slot*32 + (m - m0wg) (per-WG slot)
     unsigned long long* cand;       // [SplitN][Mp][CAP] u64, interleaved pair segments (cand_index)
     int* cnt;                       // [SplitN][M] candidates seen
     float* tau;                     // [M] row-wide tau (written by split 0 of the block)
@@ -96,6 +98,11 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
     const int bx = __builtin_amdgcn_readfirstlane(bx_in), s = __builtin_amdgcn_readfirstlane(s_in);
     const int slot = __builtin_amdgcn_readfirstlane(slot_in);
     constexpr int NUM_WARPS  = 8, SUB = 2, PF = 2;
+    // value-only samples (4-byte slots: tau streams half the bytes, 2-3.6x faster) in the plain grid variant. Not in
+    // the distributed / persistent variants: there the extra pipeline flavour made the register allocator copy or
+    // spill in-flight inline-asm prefetch registers (tools/asmloadwaw.py), so those keep the u64 records.
+    constexpr bool VALS = !DIST && !PERSIST;
+    constexpr int SSTR = VALS ? 2 : 4;   // u32 stride between a row's samples
     constexpr int BLOCK_M    = 4;
     constexpr int ROWS_WG    = BLOCK_M * NUM_WARPS;
     constexpr int TILE_N     = 32;
@@ -263,8 +270,15 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
     unsigned long long* ob_cur = A.cand;
     int64_t orow0 = 0;
     int ocap_cur = CAP, kvm = 1;
-    auto run_pipeline = [&](auto masked_c, const int tb, const int te, const int lo_, const int tc0_, const int tc1_) {
+    // sample_c (compile time): the sample pass stores only the 4-byte value per candidate - tau never needs the key
+    // index, and the tau phase is bound by the CU's share of memory bandwidth (~27 GB/s while the other CUs scan), so
+    // u64 records cost 2x the time. One store per pair either way (hand vmcnt counts unchanged).
+    auto run_pipeline = [&](auto masked_c, auto sample_c, const int tb, const int te, const int lo_, const int tc0_, const int tc1_) {
         constexpr bool MASKED = decltype(masked_c)::value;
+        constexpr bool SAMPLE = decltype(sample_c)::value;
+        // sample flavour: every permlane gets the full 2 wait states. Its schedule differs from the tuned scan one, and
+        // the compiler put a v_mov of the asm operand right before a swap (tools/permcheck.py: 0 wait states).
+        constexpr int SWN = SAMPLE ? 2 : 0;
         if (tb >= te) return;
         auto tokbase = [&](int t) -> int {
             int st = t;
@@ -274,7 +288,9 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
         __amdgpu_buffer_rsrc_t o_rsrc[BLOCK_M / 2];
         #pragma unroll
         for (int r = 0; r < BLOCK_M; r += 2)
-            o_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)(ob_cur + (orow0 + r) * ocap_cur), 0, 2 * ocap_cur * 8, FMT_BUF_RSRC_WORD3);
+            o_rsrc[r / 2] = SAMPLE ? __builtin_amdgcn_make_buffer_rsrc((void*)(reinterpret_cast<uint32_t*>(ob_cur) + (orow0 + r) * ocap_cur), 0,
+                                                                       2 * ocap_cur * 4, FMT_BUF_RSRC_WORD3)
+                                   : __builtin_amdgcn_make_buffer_rsrc((void*)(ob_cur + (orow0 + r) * ocap_cur), 0, 2 * ocap_cur * 8, FMT_BUF_RSRC_WORD3);
         const int* sel_lo = p_lo; const int* sel_hi = p_hi; const float* sel_tau = p_tau;
         auto pair_finish = [&](int r, float p0, float p1, float scale, int token_base, auto mk_c) {
             constexpr bool MK_ = decltype(mk_c)::value;
@@ -291,10 +307,15 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
             const unsigned voff = cand ? vt : 0x40800000u;
             cnt_row[r] += __builtin_popcount(mlo);
             cnt_row[r + 1] += __builtin_popcount(mhi);
-            __builtin_amdgcn_raw_buffer_store_b64(u32x2{__builtin_bit_cast(unsigned, res), (unsigned)pos}, o_rsrc[r / 2], voff, 0, 0);
+            if constexpr (SAMPLE) {   // value only, pair-interleaved 4-byte slots (slot 2 i + half)
+                const unsigned voff4 = cand ? (vt >> 1) : 0x40800000u;
+                __builtin_amdgcn_raw_buffer_store_b32(__builtin_bit_cast(unsigned, res), o_rsrc[r / 2], voff4, 0, 0);
+            } else {
+                __builtin_amdgcn_raw_buffer_store_b64(u32x2{__builtin_bit_cast(unsigned, res), (unsigned)pos}, o_rsrc[r / 2], voff, 0, 0);
+            }
         };
         auto pair_store = [&](int r, float p0, float p1, float scale, int token_base, auto mk_c, auto nops_c) {
-            swap32_reduce2<decltype(nops_c)::value>(p0, p1);
+            swap32_reduce2<SAMPLE ? SWN : decltype(nops_c)::value>(p0, p1);
             pair_finish(r, p0, p1, scale, token_base, mk_c);
         };
         u32x4 pf_reg0, pf_reg1;
@@ -360,7 +381,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
     __builtin_amdgcn_sched_barrier(0); \
     mfma_b(1, Bo[BC], acc[1]); \
     __builtin_amdgcn_sched_barrier(0); \
-    if constexpr (PEND) swap32_reduce2<0>(pd_p2, pd_p3); \
+    if constexpr (PEND) swap32_reduce2<SWN>(pd_p2, pd_p3); \
     __builtin_amdgcn_sched_barrier(0); \
     epi_half(0, acc[0], IC<1>{}, e0, o0); \
     __builtin_amdgcn_sched_barrier(0); \
@@ -395,7 +416,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
     __builtin_amdgcn_sched_barrier(0); \
     mfma_b(0, Bo[BN], acc[0]); \
     __builtin_amdgcn_sched_barrier(0); \
-    swap32_reduce2<0>(p0, p1); \
+    swap32_reduce2<SWN>(p0, p1); \
     pd_P0 = p0; pd_P1 = p1; \
     __builtin_amdgcn_sched_barrier(0); \
     epi_half(3, acc[1], IC<1>{}, pd_e3, pd_o3); \
@@ -487,7 +508,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
                         ocap_cur = dist ? ckcap : NSB; kvm = S;
                         const int lo_s = jb & ~(TILE_N - 1);
                         const int nst = FMT_CDIV(je - lo_s, STAGE_TOK);
-                        run_pipeline(std::true_type{}, 0, nst, lo_s, nst, nst);
+                        run_pipeline(std::true_type{}, std::integral_constant<bool, VALS>{}, 0, nst, lo_s, nst, nst);
                     }
                     wait_vmcnt<0>();
                     if (dist) {                     // publish the chunk: counts, then its done flag
@@ -538,19 +559,27 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
             float t4[BLOCK_M];
             const uint32_t* rowp[BLOCK_M];
             #pragma unroll
-            for (int q = 0; q < BLOCK_M; ++q) {   // record i of row q at A.smp[(srow0 + (q & ~1)) * NSB + 2 i + (q & 1)]
+            for (int q = 0; q < BLOCK_M; ++q) {   // sample i of row q: element (srow0 + (q & ~1)) * NSB + 2 i + (q & 1) of smp (u32 if VALS, else u64)
                 const int pq = (m0 + (q & ~1) < M) ? (q & ~1) : 0;   // pair past M (M % 4 in {1, 2}): valid base, masked
-                rowp[q] = reinterpret_cast<const uint32_t*>(A.smp + (srow0 + pq) * NSB + (q & 1));
+                rowp[q] = VALS ? reinterpret_cast<const uint32_t*>(A.smp) + (srow0 + pq) * NSB + (q & 1)            // value slots
+                                 : reinterpret_cast<const uint32_t*>(A.smp + (srow0 + pq) * NSB + (q & 1));   // u64 records
             }
-            wave_tau_multi<BLOCK_M, FMT_TAU_B>(rowp, 0, [&](int q, int) -> int { return ns_r[q]; }, 1, act, tgt, hist, l, t4);
+#if defined(FMT_TS) && !defined(FMT_DBGTAU)
+            long long* tsp = (A.ts && warp == 0) ? A.ts + ((int64_t)bx * SplitN + s) * 8 + 5 : nullptr;
+            wave_tau_multi<BLOCK_M, FMT_TAU_B, true, SSTR>(rowp, 0, [&](int q, int) -> int { return ns_r[q]; }, 1, act, tgt, hist, l, t4,
+                                               nullptr, tsp);
+#else
+            wave_tau_multi<BLOCK_M, FMT_TAU_B, true, SSTR>(rowp, 0, [&](int q, int) -> int { return ns_r[q]; }, 1, act, tgt, hist, l, t4);
+#endif
             #pragma unroll 1
             for (int r = 0; r < BLOCK_M; ++r) {
                 float t = t4[r];
                 if (tgt[r] > 16 * TAU_STREAM_T) {   // target beyond the per-lane filter's range (not hit at S = 32)
                     int ksc, kec;
                     row_win(r, ksc, kec);
-                    const unsigned long long* rec = A.smp + (srow0 + (r & ~1)) * NSB + (r & 1);
-                    t = wave_tau_ld([&](int i) -> float { return __builtin_bit_cast(float, (unsigned)rec[2 * i]); },
+                    const uint32_t* rec = VALS ? reinterpret_cast<const uint32_t*>(A.smp) + (srow0 + (r & ~1)) * NSB + (r & 1)
+                                               : reinterpret_cast<const uint32_t*>(A.smp + (srow0 + (r & ~1)) * NSB + (r & 1));
+                    t = wave_tau_ld([&](int i) -> float { return __builtin_bit_cast(float, rec[SSTR * i]); },
                                     ns_r[r], kec - ksc, Ktop, hist, l);
                 }
                 if (A.dbg & 1) t = __builtin_huge_valf();
@@ -592,7 +621,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
                     const int ksm = max(A.ks[m], 0), kem = min(A.ke[m], N);
                     tgt[q] = ok ? tau_target(ns, kem - ksm, Ktop) : 0;
                     act[q] = tgt[q] > 0 && tgt[q] <= 16 * TAU_STREAM_T;
-                    rowp[q] = reinterpret_cast<const uint32_t*>(A.smp + (int64_t)(m & ~1) * ckcap + (m & 1));   // segment 0
+                    rowp[q] = reinterpret_cast<const uint32_t*>(A.smp + (int64_t)(m & ~1) * ckcap + (m & 1));   // segment 0 (u64 records)
                 }
                 // per-segment counts of the rows -> the wave's histogram LDS (free until the radix zeroes it); SplitN <= 16
                 #pragma unroll
@@ -609,7 +638,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
                 #pragma unroll
                 for (int q = 0; q < NR; ++q)
                     for (int g = 0; g < 16; ++g) tab[q][g] = g < nck ? (int)hist[q * 64 + g] : -1;
-                wave_tau_multi<NR, B, false>(rowp, seg_stride, cntf, nck, act, tgt, hist, l, tq, dk);
+                wave_tau_multi<NR, B, false, 4>(rowp, seg_stride, cntf, nck, act, tgt, hist, l, tq, dk);
                 if (A.ts && l == 0) {
                     #pragma unroll
                     for (int q = 0; q < NR; ++q) {
@@ -622,7 +651,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
                     }
                 }
     #else
-                wave_tau_multi<NR, B, false>(rowp, seg_stride, cntf, nck, act, tgt, hist, l, tq);
+                wave_tau_multi<NR, B, false, 4>(rowp, seg_stride, cntf, nck, act, tgt, hist, l, tq);
     #endif
                 #pragma unroll
                 for (int q = 0; q < NR; ++q) {
@@ -704,7 +733,7 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
                 ob_cur = A.smp; orow0 = srow0; ocap_cur = NSB; kvm = S;
                 const int lo_s = jr_b & ~(TILE_N - 1);
                 const int nst = FMT_CDIV(jr_e - lo_s, STAGE_TOK);
-                run_pipeline(std::true_type{}, 0, nst, lo_s, nst, nst);
+                run_pipeline(std::true_type{}, std::integral_constant<bool, VALS>{}, 0, nst, lo_s, nst, nst);
             }
             wait_vmcnt<0>();
             FMT_TSP(1);
@@ -723,19 +752,27 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
                 float t4[BLOCK_M];
                 const uint32_t* rowp[BLOCK_M];
                 #pragma unroll
-                for (int q = 0; q < BLOCK_M; ++q) {   // record i of row q at A.smp[(srow0 + (q & ~1)) * NSB + 2 i + (q & 1)]
+                for (int q = 0; q < BLOCK_M; ++q) {   // sample i of row q: element (srow0 + (q & ~1)) * NSB + 2 i + (q & 1) of smp (u32 if VALS, else u64)
                     const int pq = (m0 + (q & ~1) < M) ? (q & ~1) : 0;   // pair past M (M % 4 in {1, 2}): valid base, masked
-                    rowp[q] = reinterpret_cast<const uint32_t*>(A.smp + (srow0 + pq) * NSB + (q & 1));
+                    rowp[q] = VALS ? reinterpret_cast<const uint32_t*>(A.smp) + (srow0 + pq) * NSB + (q & 1)            // value slots
+                                 : reinterpret_cast<const uint32_t*>(A.smp + (srow0 + pq) * NSB + (q & 1));   // u64 records
                 }
-                wave_tau_multi<BLOCK_M, FMT_TAU_B>(rowp, 0, [&](int q, int) -> int { return ns_r[q]; }, 1, act, tgt, hist, l, t4);
+#if defined(FMT_TS) && !defined(FMT_DBGTAU)
+                long long* tsp = (A.ts && warp == 0) ? A.ts + ((int64_t)bx * SplitN + s) * 8 + 5 : nullptr;
+                wave_tau_multi<BLOCK_M, FMT_TAU_B, true, SSTR>(rowp, 0, [&](int q, int) -> int { return ns_r[q]; }, 1, act, tgt, hist, l,
+                                                               t4, nullptr, tsp);
+#else
+                wave_tau_multi<BLOCK_M, FMT_TAU_B, true, SSTR>(rowp, 0, [&](int q, int) -> int { return ns_r[q]; }, 1, act, tgt, hist, l, t4);
+#endif
                 #pragma unroll 1
                 for (int r = 0; r < BLOCK_M; ++r) {
                     float t = t4[r];
                     if (tgt[r] > 16 * TAU_STREAM_T) {   // target beyond the per-lane filter's range (not hit at S = 32)
                         int ksc, kec;
                         row_win(r, ksc, kec);
-                        const unsigned long long* rec = A.smp + (srow0 + (r & ~1)) * NSB + (r & 1);
-                        t = wave_tau_ld([&](int i) -> float { return __builtin_bit_cast(float, (unsigned)rec[2 * i]); },
+                        const uint32_t* rec = VALS ? reinterpret_cast<const uint32_t*>(A.smp) + (srow0 + (r & ~1)) * NSB + (r & 1)
+                                               : reinterpret_cast<const uint32_t*>(A.smp + (srow0 + (r & ~1)) * NSB + (r & 1));
+                        t = wave_tau_ld([&](int i) -> float { return __builtin_bit_cast(float, rec[SSTR * i]); },
                                         ns_r[r], kec - ksc, Ktop, hist, l);
                     }
                     if (A.dbg & 1) t = __builtin_huge_valf();
@@ -778,9 +815,9 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
         p_lo[r / 2] = hset ? lb : la; p_hi[r / 2] = hset ? hb : ha;
     }
     ob_cur = A.cand; orow0 = (int64_t)s * Mp + m0; ocap_cur = CAP; kvm = 1;
-    run_pipeline(std::true_type{}, mi_b, mi_e, lo, tc0, tc1);
+    run_pipeline(std::true_type{}, std::false_type{}, mi_b, mi_e, lo, tc0, tc1);
     wait_vmcnt<0>();
-    run_pipeline(std::false_type{}, cl_b, cl_e, lo, tc0, tc1);
+    run_pipeline(std::false_type{}, std::false_type{}, cl_b, cl_e, lo, tc0, tc1);
     wait_vmcnt<0>();                         // load-bearing: candidate stores complete (memory model)
     FMT_TSP(3);
     if (l == 0) {

@@ -326,8 +326,43 @@ Long context and small M (`results/bench_long_shapes_fixed.json`):
 * **Pitfall:** the first version used 64-bit per-lane addresses, and with ~150 VGPRs live the compiler serialized
   every load (`global_load; s_waitcnt vmcnt(0)`): 2x SLOWER. Fixed with a uniform row base + 32-bit lane offset +
   immediates, no clamping (8192 records of slack), and 8 loads per row per round.
-* Tau per block: 16384 x 28672 29.0 -> 16.4 us; 16384 x 262144 116 -> 81 us. ISL 128K: step 2 8.343 -> 8.254 ms
-  (fair step 0 8.422).
+* Tau per block after 5c0b5ec1c: 16384 x 28672 29.0 -> 16.4 us; 16384 x 262144 116 -> 81 us (1.4-1.8x, short of
+  the planned 2-3x). ISL 128K: step 2 8.343 -> 8.254 ms (fair step 0 8.422).
+* **Reaching 2-3x (2026-11-08, later).** Timestamps inside `wave_tau_multi` (`-DFMT_TS`) showed the long-row tau is
+  spent streaming the samples (75.9 of 82.3 us at 262K):
+  * neither fewer VALU nor more loads in flight helped: a med3 insertion halved the per-sample VALU, and 16 loads
+    per row and round halved the rounds, but streaming stayed at 75.9 / 68.8 us (28K: 9.0 us either way).
+  * The cost tracks bytes: 2 MB per row block at 262K (32 rows x 8192 u64 records), 229 KB at 28K, i.e. ~27 GB/s -
+    a CU's share of memory bandwidth while every other CU streams K.
+  * So the sample pass of the plain variant now stores only the 4-byte value (a compile-time store flavour of the
+    same pipeline: one store per pair, vmcnt counts unchanged), pair-interleaved, so a 128-byte line carries 32
+    useful values instead of 16. The insertion uses floats and one `v_med3_f32` per slot (b0 = max(a0, x),
+    bt = med3(a(t-1), at, x)), no per-sample key conversion.
+  * Tau per block: **16384 x 28672 29.0 -> 14.0 us (2.1x), 16384 x 65536 36.0 -> 16.2 us (2.2x), 16384 x 262144
+    116.2 -> 32.7 us (3.6x)** (streaming at 262K 75.9 -> 26.7 us; final code, re-probed after the permlane fix).
+  * The gate caught a hazard on the way: with the value-only flavour also in the distributed and persistent kernels,
+    the register allocator copied (`v_mov`) or spilled (`scratch_store`) in-flight inline-asm prefetch registers
+    (`asmloadwaw.py`: 2 hits each). Those variants keep the u64 records (their tau computes ~1 row per wave over
+    several segments, not the 4-row lockstep); all gates are clean.
+* **A real permlane hazard in the sample flavour (found by `tools/permcheck.py`, fixed).** In the value-only build
+  the compiler copied an inline-asm operand right before the swap: `v_mov_b32 v38, v238` directly followed by
+  `v_permlane32_swap_b32 v38, v34`, 0 wait states where gfx950 needs 2 (VALU write -> permlane read). The swap
+  helper had no `s_nop` there because the tuned scan schedule never put a VALU write of the operand that close, and
+  the hazard recognizer does not look inside inline asm. Every value-only kernel had this one site, in the deferred
+  pair swap of `SUBTILE`.
+  * **It corrupted samples on the hardware.** The `m9` runs (value-only flavour, hazard present) show step 2 with
+    more candidates than the u64 path on every value-only launch, falling off as ~1/N: 16384 x 8192 1417 -> 1490
+    (+5.2 %), 16384 x 16384 +1.9 %, 16384 x 28672 +1.0 %, 16384 x 262144 +0.1 %; plus 381 more tau = -inf rows at
+    16384 x 4096. Exactness held (a tau that is too high is caught by the count check, one that is too low only
+    adds candidates), so the tests could not see it.
+  * Fix: in the sample flavour every permlane gets the full 2 wait states (`s_nop 1`, all three swap sites of
+    `run_pipeline`); the scan flavour's code is unchanged. With the fix (`m10`) step 2's candidate counts equal
+    the u64 path's exactly on every chunk.
+  * The 16384 x 4096 slowdown that had limited the value-only flavour to N >= 16384 (0.281 -> 0.300 ms in `m9`) was
+    this hazard: on the fixed build value-only samples are equal or faster at short N too (16384 x 4096 0.278 vs
+    0.281, 16384 x 8192 0.514 vs 0.516, 16384 x 12288 0.733 vs 0.736 ms; `results/m10_valsall_check.json` vs
+    `results/m10_short_vals16k.json`). So the plain variant always uses value-only samples: no threshold, 4 fewer
+    kernel instantiations.
 
 ### 2. Distributed sampling for SplitN > 1
 
@@ -377,14 +412,20 @@ Long context and small M (`results/bench_long_shapes_fixed.json`):
    the per-block layout while its kernel (plain variant) uses per-WG slots: a GPU memory fault in the tests. The
    committed driver keeps the per-WG slots (unchanged from 5c0b5ec1c).
 
-**Gates and tests on the final build:**
-* ISA gates on all 10 kernels: asm-load touches 0, VALU-SGPR -> VMEM 0, wbl2 0, permlane 0. Scratch inside the
-  pipelines is 0, except step 4's known compiler-waited reloads.
+**Gates and tests on the final build** (value-only samples in every plain launch, permlane fix):
+* ISA gates on all 26 functions of the module (9 fused kernels, `fused_item_call`, scan / tau / select / fallback
+  kernels): asm-load touches 0, VALU-SGPR -> VMEM 0, wbl2 0, permlane 0. Scratch inside the pipelines is 0, except
+  step 4's known 11 compiler-waited reloads.
 * `test_exact --quick`: 16/16 for steps 0-1; 22/22 for steps 2-4, including the forced-split stealing and
-  M % 4 in {1, 2} cases. Step 2's full suite: 34/34.
-* `repeat_check` 2|3|4 pass. Repro loops: 0 failures.
+  M % 4 in {1, 2} cases.
+* Repro loops (fresh poisoned workspaces, steps 2-4): 8193 x 8192, 1000 x 3000, 1001 x 9000, 1001 x 16384 (150
+  launches each), 576 x 250000 (100): 0 wrong rows. `repeat_check` 2|3|4 pass.
+* Benchmarks: 0 wrong rows and 0 fallback rows in all 64 (chunk, path) entries; step 2's candidate counts equal
+  step 0's, or are slightly lower (1400.7 vs 1405.2 on 13312 x 32000).
+* Tau per block on the final code (`ts_probe.py`, `-DFMT_TS` build): 16384 x 28672 14.0 us, 16384 x 65536 16.2 us,
+  16384 x 262144 32.7 us (16384 x 8192: 10.4 us).
 
-### Results (ms, 1 layer, top-512; final build, `results/m8_128k_final.json` and `results/m8_long_final.json`, 3 rounds)
+### Results (ms, 1 layer, top-512; final build, `results/m11_128k_final.json`, `results/m11_long_final.json`, 3 rounds)
 
 "Fair step 0" is `step0ks32` at its best: its standalone tau and select kernels use the shuffle `find256`.
 "Step 2 before" is the last run before this round on the 946ab423f build: `results/m1_*`, and
@@ -392,31 +433,41 @@ Long context and small M (`results/bench_long_shapes_fixed.json`):
 
 | chunk (splits, variant) | fair step 0 | step 2 before | **step 2 now** | step 3 | step 4 |
 |---|---|---|---|---|---|
-| ISL 128K (8 chunks) | 8.476 | 8.343 | **8.281 (-2.3 %)** | 8.487 | 9.447 |
-| 16384 x 65536 (1) | 3.660 | 3.644 | **3.621 (-1.1 %)** | 3.628 | 3.883 |
-| 13312 x 32000 (3, plain) | 1.616 | 1.600 | **1.599 (-1.1 %)** | 1.664 | 1.835 |
-| 16384 x 262144 (1) | 14.164 | 14.388 | 14.324 (+1.1 %) | 14.777 | 15.635 |
-| 4096 x 131072 (2, plain) | 1.876 | 1.916 | 1.916 (+2.1 %) | 1.941 | 2.187 |
-| 2048 x 131072 (4, distributed) | 0.971 | 1.044 | 1.030 (+6.1 %) | 1.096 | 1.210 |
-| 576 x 250000 (14, distributed) | 0.562 | 0.742 | 0.621 (+10.5 %) | 0.684 | 0.907 |
+| ISL 128K (8 chunks) | 8.491 | 8.343 | **8.254 (-2.8 %)** | 8.456 | 9.404 |
+| 16384 x 65536 (1) | 3.660 | 3.644 | **3.607 (-1.4 %)** | 3.608 | 3.861 |
+| 13312 x 32000 (3, plain) | 1.595 | 1.600 | **1.577 (-1.1 %)** | 1.644 | 1.809 |
+| 16384 x 262144 (1) | 14.180 | 14.388 | 14.207 (+0.2 %) | 14.192 | 15.203 |
+| 4096 x 131072 (2, plain) | 1.879 | 1.916 | 1.899 (+1.1 %) | 1.931 | 2.102 |
+| 2048 x 131072 (4, distributed) | 0.970 | 1.044 | 1.030 (+6.2 %) | 1.092 | 1.200 |
+| 576 x 250000 (14, distributed) | 0.560 | 0.742 | 0.620 (+10.7 %) | 0.683 | 0.902 |
 
-0 wrong rows and 0 fallback rows on every chunk. The earlier runs of this round (`m3`-`m7`) measured step 0 with
-the DPP `find256` in its tau kernel and are therefore 2-5 % slow on the long-row few-row shapes (576 x 250000:
-0.587-0.595 vs 0.562 now).
+* ISL 128K per chunk: step 2 is faster than fair step 0 on all 8 chunks, from -7.5 % (16384 x 4096: 0.278 vs 0.301)
+  to -0.8 % (13312 x 32000).
+* 16384 x 262144: +0.03 %, +0.1 % and +0.2 % in the three runs `m9`-`m11` (14.20 vs 14.18-14.20 ms), i.e. on par;
+  it was +1.1 % with the u64 samples (`m8`).
+* The earlier runs of this round (`m3`-`m7`) measured step 0 with the DPP `find256` in its tau kernel and are
+  therefore 2-5 % slow on the long-row few-row shapes (576 x 250000: 0.587-0.595 vs 0.560 now). `m9` is the
+  value-only build with the permlane hazard (inflated step-2 candidates), `m10_*_vals16k` the fixed build with the
+  value-only flavour limited to N >= 16384.
 
 ### Status vs the plan
 
 * Step 1: done.
-* Step 3: tau 1.4-1.8x faster per block.
-* Step 2: implemented as planned and verified.
-* **Against step 0 at its best, step 2 wins** at ISL 128K (-2.3 %), at 64K pools (-1.1 %) and on the 3-split chunk
-  (-1.1 %).
-* **It trails** at 262K pools (+1.1 %), on the 2-split chunk (+2.1 %) and on few-row long-context chunks:
-  2048 x 131072 +6.1 %, 576 x 250000 +10.5 %.
-* Same-build gaps before -> after this round on those two chunks: 576 x 250000 +30.6 % -> +10.5 % (step 2 0.742 ->
-  0.621); 2048 x 131072 +7.1 % -> +6.1 % (step 2 1.044 -> 1.030).
+* Step 2 (distributed sampling): implemented as planned (own key range per split, rows spread over all splits' waves,
+  work-stealing chunk claims) and verified, including forced stealing on grids far larger than the GPU.
+* Step 3 (faster in-kernel tau): **2.1-3.6x per block** on the final code (14.0 / 16.2 / 32.7 us at 28K / 64K / 262K
+  pools, from 29.0 / 36.0 / 116.2): the 4-row lockstep gave 1.4-1.8x; value-only samples, which halve the streamed
+  bytes, gave the rest.
+* **Against step 0 at its best, step 2 wins** at ISL 128K (-2.8 %, on every one of its 8 chunks), at 64K pools
+  (-1.4 %) and on the 3-split chunk (-1.1 %), and is on par at 262K pools (+0.2 %).
+* **It trails** on the 2-split chunk (+1.1 %) and on few-row long-context chunks: 2048 x 131072 +6.2 %,
+  576 x 250000 +10.7 %.
+* Same-build gaps before -> after this round on those two chunks: 576 x 250000 +30.6 % -> +10.7 % (step 2 0.742 ->
+  0.620); 2048 x 131072 +7.1 % -> +6.2 % (step 2 1.044 -> 1.030).
 * What remains, measured:
   * The critical path before the scan in the distributed variant is ~100 us at 576 x 250000: the slowest chunk's
     sampling (~34 us), then one row's tau per wave plus two flag hand-offs (~67 us). Step 0 runs its separate
     passes (sample + tau + prep 70.5 us) across all CUs with no cross-split wait.
-  * The distributed variant's scan loop carries more register pressure (+1.5 % VALU, SGPR-spill reloads).
+  * The distributed variant's scan loop carries more register pressure (+1.5 % VALU, SGPR-spill reloads), and it
+    keeps u64 sample records (the value-only flavour there made the allocator copy / spill in-flight prefetch
+    registers).

@@ -144,6 +144,9 @@ Modes (compile-time):
   runs the sample pass through the same EV4 emission pipeline (key stride S, records into `smp`) over the whole block
   range, computes tau per row and publishes it (release store of the launch epoch in `tau_ready[bx]`); the other
   splits poll and acquire. Then the masked and clean EMIT pipelines. -> 3 launches (fused, select, fallback1).
+  The sample pass stores fp32 values only (pair-interleaved 4-byte slots: tau never needs the key index, and the
+  tau phase is bound by the CU's share of memory bandwidth). Tau runs the wave's 4 rows in lockstep: each lane
+  keeps its 8 largest samples per row (one `v_med3_f32` per slot), then a relative two-pass radix over the 4 rows.
   Since 2026-11-08 there are two compiled variants (template flag `DIST`). The plain variant is the scheme above; for
   SplitN >= 4 grids that fit on the GPU, the distributed variant samples each split's key range in parallel
   (claimable chunks, work stealing), spreads the block's rows over all splits' waves for tau, and publishes per-row
@@ -168,6 +171,11 @@ Modes (compile-time):
   compare/ballot/mbcnt/select adds VALU; the removed fp32 store saves energy (kernel is also at the 1400 W cap).
 * Hazards: inline-asm permlane / buffer ops are invisible to the hazard recognizer; keep the >= 2-instruction rule
   before every permlane and run Nam's `check_asm_loads.py` style audit on the ISA (all loads hazard-free).
+  As implemented: the gates in `tools/` run on every kernel of every build (`asmloadwaw.py`, `sgprhaz2.py`,
+  `wbl2check.py`, `permcheck.py`, `scratchloc.py`). The permlane rule cannot rely on the source schedule alone: in
+  the value-only sample flavour the compiler placed a `v_mov` copy of the asm operand right before the swap
+  (0 wait states), and on the hardware this corrupted sample values (looser tau, measured; see PROGRESS.md
+  2026-11-08). Swaps in code without a hand-tuned schedule carry their own `s_nop 1`.
 * In-kernel select runs at the scan's occupancy (2 waves/SIMD); measure it against the standalone select.
 * Cross-XCD coherence for split hand-offs (section 4.2).
 * Code size / I-cache (3 pipeline instantiations in one kernel).
