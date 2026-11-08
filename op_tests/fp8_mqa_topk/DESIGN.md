@@ -116,13 +116,17 @@ Modes (compile-time):
   chains `ae = ye*w0; ae = fma(ye, w_v, ae)`, `p = ae + ao`, permlane32 swap, `(p0 + p1) * scale`) into a scratch row,
   then radix select. NOTE fuse48's recompute32 mirrors v35/v35a (scaled MFMA with 2^-25, v_pk_mul clamp) and is NOT
   bit-exact with v35wes.
-* Memory model (as implemented): an agent-scope release does NOT wait for inline-asm stores, so every hand-off is
-  `s_waitcnt vmcnt(0)` in every wave -> WG barrier -> one agent-scope atomic by one lane (acq_rel counter, or release
-  store of the launch epoch) -> broadcast through LDS -> acquire fence in every reading wave. Spin-waits poll with
-  RELAXED agent-scope loads and acquire once after the barrier (an acquire load per poll emits `buffer_inv sc1` per
-  iteration and slowed the producers 2-4x). sc0 = workgroup scope, sc1 = agent scope. Every release is written by
-  hand (`FMT_RELEASE_AGENT()`: vmcnt(0) -> buffer_wbl2 sc1 -> vmcnt(0)) before a relaxed store / acquire RMW: the
-  compiler drops the wait after its own buffer_wbl2 when its scoreboard is empty (tools/wbl2check.py).
+* Memory model (as implemented): an agent-scope release does NOT wait for inline-asm stores, and the compiler can
+  drop the wait after its own `buffer_wbl2` (SIInsertWaitcnts does not count it). So every release is written by
+  hand: `s_waitcnt vmcnt(0)` in every wave that wrote the data -> (WG barrier when several waves wrote it) -> the
+  publishing lane runs `FMT_RELEASE_AGENT()` (vmcnt(0) -> buffer_wbl2 sc1 -> vmcnt(0)) and then a RELAXED store of
+  the launch epoch or an ACQUIRE RMW. Consumers poll with RELAXED agent-scope loads and acquire once (an acquire load
+  per poll emits `buffer_inv sc1` per iteration and slowed the producers 2-4x).
+  * WG-wide hand-offs (chunk-done, `tau_ready`, `block_done`, persistent counters): the consumer's polling lane
+    acquires, a WG barrier, then every wave acquires.
+  * The distributed variant's per-row tau flags are per wave: the computing wave's lane 0 releases after that wave's
+    own vmcnt(0) (no WG barrier); each waiting wave polls with lanes 0-3 and acquires itself.
+  sc0 = workgroup scope, sc1 = agent scope. Gates: tools/wbl2check.py, tools/asmloadwaw.py.
 * Counters (fallback count, split-completion counters, persistent claim/done counters) live in a small int32
   workspace zeroed ONCE at allocation; whoever consumes a counter resets it to 0 for the next launch (no memset
   launches).

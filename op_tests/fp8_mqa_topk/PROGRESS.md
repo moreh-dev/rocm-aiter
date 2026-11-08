@@ -318,8 +318,11 @@ Long context and small M (`results/bench_long_shapes_fixed.json`):
 * `wave_tau_multi`: the 4 rows of a wave in lockstep.
   * Each lane keeps its 8 largest keys per row, then the relative two-pass radix runs on the 4 rows together (4 x
     256-bin LDS histograms per wave). The kept keys are a subset of the samples, so tau stays a valid lower bound.
-* `wave_find256`: a DPP scan with readlane broadcasts replaces 6 dependent `__shfl_up` round trips. It is shared by
-  every tau and every select, so step 0 also got slightly faster.
+* `wave_find256`: a DPP scan with readlane broadcasts replaces 6 dependent `__shfl_up` round trips. It helps at
+  the fused kernel's 2 waves / SIMD. It was first applied everywhere, which slowed step 0's high-occupancy tau
+  kernel on long rows (step 0's sample + tau + prep 70.5 -> 97.0 us on 576 x 250000; the "fair step 0" runs m3-m7
+  carry this). Now chosen per caller: the standalone tau and select kernels use the shuffle version again (see the
+  final table).
 * **Pitfall:** the first version used 64-bit per-lane addresses, and with ~150 VGPRs live the compiler serialized
   every load (`global_load; s_waitcnt vmcnt(0)`): 2x SLOWER. Fixed with a uniform row base + 32-bit lane offset +
   immediates, no clamping (8192 records of slack), and 8 loads per row per round.
@@ -351,22 +354,28 @@ Long context and small M (`results/bench_long_shapes_fixed.json`):
      * Two sites in step 4's item body: the chunk-done release, and the long-standing `block_done` RMW (step 4
        with SplitN > 1 could read another split's stale candidates).
      * Fix: `FMT_RELEASE_AGENT()` (inline asm: `s_waitcnt vmcnt(0) lgkmcnt(0); buffer_wbl2 sc1; s_waitcnt
-       vmcnt(0)`) before every flag store / RMW, at all 7 release sites (fused, persistent, fallback1); the RMWs
-       now have acquire order only.
+       vmcnt(0)`) before every flag store / RMW, at all 8 release sites: the fused item body (chunk-done, row-tau,
+       `tau_ready`, `block_done`), the persistent kernel (`ctr[1]`, `ctr[3]`) and fallback1 (per-row done,
+       `fb_exit`). No release / acq_rel atomics remain; the RMWs have acquire order only.
      * New gate `tools/wbl2check.py`: on the reviewed snapshot it finds exactly the 2 sites; on the final build, 0.
-   * **Out-of-bounds read at SplitN = 1:** when M % 4 is 1 or 2, the tau loads of the row pair past M could read
-     beyond the sample buffer's slack. That pair now gets a valid base.
+   * **Out-of-bounds read in the split-0 sampling path:** when M % 4 is 1 or 2, the 4-row tau loads of the row
+     pair past M used an unguarded base. Since 5c0b5ec1c that path served every SplitN in steps 2-3 (most reachable
+     on few-row, long-row chunks: rows of ~131K+ keys read past the 8192-record slack). That pair now gets a valid
+     base in both variants. The new 1001 x 9000 / 1002 x 20000 cases only exercise the path; their over-read
+     would stay inside the slack, so they could not have caught the bug.
 3. **Register pressure.** In the shared kernel the distributed code raised the scan loop from 19.85 to 20.15
-   VALU/MFMA and from 1 to 24 SGPR-spill readlane/writelane. ISL 128K went 8.254 -> 8.435 and step 4 got ~10 %
-   slower.
+   VALU/MFMA and from 1 to 24 SGPR-spill readlane/writelane. Step 4 got ~10 % slower (`m4` / `m5`), and the seven
+   single-split 128K chunks +1.0 %. ISL 128K went 8.254 -> 8.435 (`m5`), but 0.115 ms of that rise is the
+   oversized 3-split chunk of item 4.
    * Moving the tau phase behind a `__noinline__` call was worse: the caller spilled 52 -> 484 B.
    * Fix: two compiled variants (`DIST` template flag). The launcher uses DIST only for SplitN >= 4 grids that fit
      on the GPU (rb * SplitN <= CUs). At SplitN = 2 the variant cost more than it saved (1.978 vs 1.920 ms).
 4. **Oversized grids** (13312 x 32000, 3 splits, 1248 WGs). The split-0 WGs run first and steal every chunk, then
    compute 32 rows two at a time: 1.60 -> 1.90 ms. Fix: inside DIST, a grid that does not fit uses one whole-range
    chunk and 4 rows per wave. Stealing keeps either mode correct.
-5. **Persistent sample buffer (my driver change).** Step 4 was allocated the per-block layout while its kernel
-   (plain variant) uses per-WG slots: a GPU memory fault in the tests. Fixed.
+5. **Persistent sample buffer (intermediate work, never committed).** A driver edit during this round gave step 4
+   the per-block layout while its kernel (plain variant) uses per-WG slots: a GPU memory fault in the tests. The
+   committed driver keeps the per-WG slots (unchanged from 5c0b5ec1c).
 
 **Gates and tests on the final build:**
 * ISA gates on all 10 kernels: asm-load touches 0, VALU-SGPR -> VMEM 0, wbl2 0, permlane 0. Scratch inside the
@@ -375,30 +384,39 @@ Long context and small M (`results/bench_long_shapes_fixed.json`):
   M % 4 in {1, 2} cases. Step 2's full suite: 34/34.
 * `repeat_check` 2|3|4 pass. Repro loops: 0 failures.
 
-### Results (ms, 1 layer, top-512; `results/m6_*`, `results/m7_multisplit.json`)
+### Results (ms, 1 layer, top-512; final build, `results/m8_128k_final.json` and `results/m8_long_final.json`, 3 rounds)
+
+"Fair step 0" is `step0ks32` at its best: its standalone tau and select kernels use the shuffle `find256`.
+"Step 2 before" is the last run before this round on the 946ab423f build: `results/m1_*`, and
+`results/bench_long_shapes_r2.json` for 4096 x 131072.
 
 | chunk (splits, variant) | fair step 0 | step 2 before | **step 2 now** | step 3 | step 4 |
 |---|---|---|---|---|---|
-| ISL 128K (8 chunks) | 8.421 | 8.343 | **8.245 (-2.1 %)** | 8.530 | 9.473 |
-| 16384 x 65536 (1) | 3.653 | 3.644 | **3.619 (-0.9 %)** | 3.627 | 3.887 |
-| 16384 x 262144 (1) | 14.285 | 14.388 | 14.335 (+0.4 %) | 14.349 | 15.233 |
-| 13312 x 32000 (3, plain) | 1.601 | 1.600 | **1.593 (-0.5 %)** | 1.663 | - |
-| 4096 x 131072 (2, plain) | 1.892 | 1.916 | 1.920 (+1.5 %) | 1.948 | - |
-| 2048 x 131072 (4, distributed) | 0.985 | 1.044 | 1.030 (+4.6 %) | 1.097 | - |
-| 576 x 250000 (14, distributed) | 0.593 | 0.742 | 0.624 (+5.2 %) | 0.689 | - |
+| ISL 128K (8 chunks) | 8.476 | 8.343 | **8.281 (-2.3 %)** | 8.487 | 9.447 |
+| 16384 x 65536 (1) | 3.660 | 3.644 | **3.621 (-1.1 %)** | 3.628 | 3.883 |
+| 13312 x 32000 (3, plain) | 1.616 | 1.600 | **1.599 (-1.1 %)** | 1.664 | 1.835 |
+| 16384 x 262144 (1) | 14.164 | 14.388 | 14.324 (+1.1 %) | 14.777 | 15.635 |
+| 4096 x 131072 (2, plain) | 1.876 | 1.916 | 1.916 (+2.1 %) | 1.941 | 2.187 |
+| 2048 x 131072 (4, distributed) | 0.971 | 1.044 | 1.030 (+6.1 %) | 1.096 | 1.210 |
+| 576 x 250000 (14, distributed) | 0.562 | 0.742 | 0.621 (+10.5 %) | 0.684 | 0.907 |
 
-0 wrong rows and 0 fallback rows on every chunk. Step 0 varies by about +-2 % between runs on the small-M shapes
-(2048 x 131072: 0.985-1.010).
+0 wrong rows and 0 fallback rows on every chunk. The earlier runs of this round (`m3`-`m7`) measured step 0 with
+the DPP `find256` in its tau kernel and are therefore 2-5 % slow on the long-row few-row shapes (576 x 250000:
+0.587-0.595 vs 0.562 now).
 
 ### Status vs the plan
 
 * Step 1: done.
 * Step 3: tau 1.4-1.8x faster per block.
 * Step 2: implemented as planned and verified.
-* Step 2 now beats a fair step 0 at ISL 128K (-2.1 %), at 64K pools and on the 3-split chunk; it ties at 262K pools.
-* **It still trails on few-row long-context chunks (SplitN >= 4): +2-5 %.** Distributed sampling cut those gaps
-  from 25 % / 6 % to 5 % / 2-5 %. What remains, measured:
-  * The critical path before the scan: the slowest chunk's sampling plus one row's tau per wave plus two flag
-    hand-offs, ~100 us at 576 x 250000. Step 0 runs its separate passes (~72 us) across all CUs with no
-    cross-split wait.
+* **Against step 0 at its best, step 2 wins** at ISL 128K (-2.3 %), at 64K pools (-1.1 %) and on the 3-split chunk
+  (-1.1 %).
+* **It trails** at 262K pools (+1.1 %), on the 2-split chunk (+2.1 %) and on few-row long-context chunks:
+  2048 x 131072 +6.1 %, 576 x 250000 +10.5 %.
+* Same-build gaps before -> after this round on those two chunks: 576 x 250000 +30.6 % -> +10.5 % (step 2 0.742 ->
+  0.621); 2048 x 131072 +7.1 % -> +6.1 % (step 2 1.044 -> 1.030).
+* What remains, measured:
+  * The critical path before the scan in the distributed variant is ~100 us at 576 x 250000: the slowest chunk's
+    sampling (~34 us), then one row's tau per wave plus two flag hand-offs (~67 us). Step 0 runs its separate
+    passes (sample + tau + prep 70.5 us) across all CUs with no cross-split wait.
   * The distributed variant's scan loop carries more register pressure (+1.5 % VALU, SGPR-spill reloads).

@@ -32,25 +32,41 @@ __device__ __forceinline__ int wave_incl_scan_dpp(int x) {
     return x;
 }
 // bin of the target-th largest key in a 256-bin histogram (lane l owns bins 4l..4l+3); fab = keys in higher bins,
-// fcnt = keys in the bin. One ds_read_b128 per lane, DPP scan, readlane broadcasts (hist 16-byte aligned).
+// fcnt = keys in the bin. Two versions, chosen per caller:
+//  DPP = false: shuffle scan (ds_bpermute) - the LDS pipe runs in parallel with the VALU, faster in the
+//    high-occupancy standalone tau / select kernels (step 0 tau phase 70.5 vs 97.0 us on 576 x 250000);
+//  DPP = true (default): DPP scan + readlane broadcasts + one ds_read_b128 - fewer dependent round trips, faster at the fused
+//    kernel's 2 waves / SIMD (in-kernel tau, wave_tau_multi). hist 16-byte aligned.
+template <bool DPP = true>
 __device__ __forceinline__ void wave_find256(const uint32_t* hist, int target, int lane, int& fbin, int& fab, int& fcnt) {
     const int lo = lane * 4;
-    const u32x4 h4 = *reinterpret_cast<const u32x4*>(&hist[lo]);
-    const int incl = wave_incl_scan_dpp((int)(h4[0] + h4[1] + h4[2] + h4[3]));
-    int cum = __builtin_amdgcn_readlane(incl, WARP - 1) - incl, fb = -1, fa = 0, fc = 0;
-    #pragma unroll
-    for (int k = 3; k >= 0; --k) {
-        const int h = (int)h4[k];
-        if (cum < target && cum + h >= target) { fb = lo + k; fa = cum; fc = h; }
-        cum += h;
+    if constexpr (!DPP) {
+        int s4 = 0;
+        for (int b = lo; b < lo + 4; ++b) s4 += hist[b];
+        const int incl = wave_incl_scan(s4, lane);
+        int cum = __shfl(incl, WARP - 1) - incl, fb = -1, fa = 0, fc = 0;
+        for (int b = lo + 3; b >= lo; --b) { const int h = hist[b]; if (cum < target && cum + h >= target) { fb = b; fa = cum; fc = h; } cum += h; }
+        const uint64_t bm = __ballot(fb >= 0);
+        const int src = bm ? __builtin_ctzll(bm) : 0;
+        fbin = __shfl(fb, src); fab = __shfl(fa, src); fcnt = __shfl(fc, src);
+    } else {
+        const u32x4 h4 = *reinterpret_cast<const u32x4*>(&hist[lo]);
+        const int incl = wave_incl_scan_dpp((int)(h4[0] + h4[1] + h4[2] + h4[3]));
+        int cum = __builtin_amdgcn_readlane(incl, WARP - 1) - incl, fb = -1, fa = 0, fc = 0;
+        #pragma unroll
+        for (int k = 3; k >= 0; --k) {
+            const int h = (int)h4[k];
+            if (cum < target && cum + h >= target) { fb = lo + k; fa = cum; fc = h; }
+            cum += h;
+        }
+        const uint64_t bm = __ballot(fb >= 0);
+        const int src = bm ? __builtin_ctzll(bm) : 0;
+        fbin = __builtin_amdgcn_readlane(fb, src); fab = __builtin_amdgcn_readlane(fa, src); fcnt = __builtin_amdgcn_readlane(fc, src);
     }
-    const uint64_t bm = __ballot(fb >= 0);
-    const int src = bm ? __builtin_ctzll(bm) : 0;
-    fbin = __builtin_amdgcn_readlane(fb, src); fab = __builtin_amdgcn_readlane(fa, src); fcnt = __builtin_amdgcn_readlane(fc, src);
 }
 
 // radix over 32-bit keys delivered by each(f) (f(key, col) called per element, non-uniformly) -> key T of rank K
-template <int NRD, typename Each>
+template <int NRD, bool DPP = true, typename Each>
 __device__ __forceinline__ void wave_radix(Each&& each, uint32_t* hist, int K, int lane, uint32_t& T, int& above, int& cnt_eq) {
     uint32_t prefix = 0; above = 0; cnt_eq = 0;
     #pragma unroll
@@ -62,7 +78,7 @@ __device__ __forceinline__ void wave_radix(Each&& each, uint32_t* hist, int K, i
         each([&](uint32_t k, int) { if (r == 0 || (uint32_t)((uint64_t)k >> (sh + 8)) == pf) atomicAdd(&hist[(k >> sh) & 255], 1u); });
         mem_fence_wave();
         int fb, fa, fc;
-        wave_find256(hist, K - above, lane, fb, fa, fc);
+        wave_find256<DPP>(hist, K - above, lane, fb, fa, fc);
         prefix = (prefix << 8) | (uint32_t)fb; above += fa; cnt_eq = fc;
         mem_fence_wave();
     }
@@ -141,7 +157,7 @@ __device__ __forceinline__ uint32_t wave_min_u32(uint32_t x) { return ~wave_max_
 // Pass 1 histograms the 8 bits just below the common prefix of [kmin, kmax], pass 2 the next 8 bits inside the bin
 // holding the target-th largest key, so the bucket resolution is ~(kmax - kmin) / 2^16 whatever the score offset.
 // Returns the lowest float of the final bucket (<= the target-th largest sample): conservative.
-template <int R>
+template <int R, bool DPP = true>
 __device__ __forceinline__ float wave_tau_relradix(const uint32_t (&rk)[R], int target, uint32_t* hist, int lane) {
     uint32_t vmax = 0u, vmin = 0xFFFFFFFFu;
     #pragma unroll
@@ -159,7 +175,7 @@ __device__ __forceinline__ float wave_tau_relradix(const uint32_t (&rk)[R], int 
     for (int j = 0; j < R; ++j) if (rk[j]) atomicAdd(&hist[(rk[j] >> sh1) & 255u], 1u);
     mem_fence_wave();
     int b1, a1, c1;
-    wave_find256(hist, target, lane, b1, a1, c1);
+    wave_find256<DPP>(hist, target, lane, b1, a1, c1);
     uint32_t T = (pre1 << 8 | (uint32_t)b1) << sh1;
     if (sh1 > 0) {
         // pass 2: keys whose bits above sh1 equal T's
@@ -173,7 +189,7 @@ __device__ __forceinline__ float wave_tau_relradix(const uint32_t (&rk)[R], int 
             if (rk[j] && (rk[j] >> sh1) == hiT) atomicAdd(&hist[(rk[j] >> sh2) & ((1u << w2) - 1u)], 1u);
         mem_fence_wave();
         int b2, a2, c2;
-        wave_find256(hist, target - a1, lane, b2, a2, c2);
+        wave_find256<DPP>(hist, target - a1, lane, b2, a2, c2);
         T |= (uint32_t)b2 << sh2;
     }
     return __builtin_bit_cast(float, okey32_inv(T));
@@ -185,7 +201,7 @@ __device__ __forceinline__ float wave_tau_relradix(const uint32_t (&rk)[R], int 
 // largest: tau stays a valid lower bound (it is lower - more candidates, still exact - only when one lane held more
 // than T of the top-`target` samples). Replaces the radix path with one dependent global load per step (2.9 ms on a
 // 576 x 250000 chunk at S = 32 inside the 1-WG/CU fused kernel). The caller checks target <= 16 T.
-template <int T, int B, typename LD>
+template <int T, int B, bool DPP = true, typename LD>
 __device__ __forceinline__ float wave_tau_stream(LD& ld, int ns, int target, uint32_t* hist, int lane) {
     uint32_t top[T];
     #pragma unroll
@@ -207,7 +223,7 @@ __device__ __forceinline__ float wave_tau_stream(LD& ld, int ns, int target, uin
             top[T - 1] = max(top[T - 1], x);
         }
     }
-    return wave_tau_relradix<T>(top, target, hist, lane);
+    return wave_tau_relradix<T, DPP>(top, target, hist, lane);
 }
 constexpr int TAU_STREAM_T = 8, TAU_STREAM_B = 16;
 
@@ -304,7 +320,7 @@ __device__ __forceinline__ void wave_tau_multi(const uint32_t* const (&rowp)[NR]
     #pragma unroll
     for (int q = 0; q < NR; ++q) {
         int b1, c1;
-        wave_find256(hist + q * 256, tgt[q], lane, b1, a1[q], c1);
+        wave_find256<true>(hist + q * 256, tgt[q], lane, b1, a1[q], c1);
         Tk[q] = (pre1[q] << 8 | (uint32_t)(b1 & 255)) << sh1[q];
     }
     mem_fence_wave();
@@ -324,7 +340,7 @@ __device__ __forceinline__ void wave_tau_multi(const uint32_t* const (&rowp)[NR]
     #pragma unroll
     for (int q = 0; q < NR; ++q) {
         int b2, a2, c2;
-        wave_find256(hist + q * 256, tgt[q] - a1[q], lane, b2, a2, c2);
+        wave_find256<true>(hist + q * 256, tgt[q] - a1[q], lane, b2, a2, c2);
         const uint32_t Tf = sh1[q] > 0 ? (Tk[q] | ((uint32_t)(b2 & 255) << sh2[q])) : Tk[q];
         const bool flat = kmax[q] == kmin[q];
         const uint32_t key = flat ? kmax[q] : Tf;
@@ -344,7 +360,7 @@ __device__ __forceinline__ int tau_target(int ns, int nvalid, int K) {
 // below the common prefix of the row's min / max key; stops as soon as the boundary bin holds exactly the keys still
 // needed (then every key >= the bin's lower edge is selected). Returns T / above / cnt_eq in wave_emit's convention:
 // emit keys > T, then keys == T until K. Typically 2-3 passes instead of a 32-step bitwise search.
-template <int R>
+template <int R, bool DPP = true>
 __device__ __forceinline__ void wave_select_relradix(const uint32_t (&rk)[R], int K, uint32_t* hist, int lane,
                                                      uint32_t& T, int& above, int& cnt_eq) {
     uint32_t vmax = 0u, vmin = 0xFFFFFFFFu;
@@ -372,7 +388,7 @@ __device__ __forceinline__ void wave_select_relradix(const uint32_t (&rk)[R], in
         }
         mem_fence_wave();
         int b, ab, cb;
-        wave_find256(hist, need, lane, b, ab, cb);
+        wave_find256<DPP>(hist, need, lane, b, ab, cb);
         pref |= (uint32_t)b << sh;
         above += ab; need -= ab;
         mem_fence_wave();
@@ -391,7 +407,7 @@ __device__ __forceinline__ void wave_select_relradix(const uint32_t (&rk)[R], in
 // count (wave-uniform branch), and only the top 20 bits of the order key are searched (tau = lowest float of that
 // 2^-11-relative bucket, still <= the target-th largest sample).
 constexpr int TAU_LOWBIT = 12;
-template <int R, bool COHERENT>
+template <int R, bool COHERENT, bool DPP = true>
 __device__ __forceinline__ float wave_tau_regs(const float* __restrict__ srow, int a, int b, int target, uint32_t* hist, int lane) {
     uint32_t rk[R];
     if constexpr (COHERENT) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -401,22 +417,22 @@ __device__ __forceinline__ float wave_tau_regs(const float* __restrict__ srow, i
         const float v = srow[min(c, b - 1)];
         rk[j] = c < b ? okey32(__builtin_bit_cast(uint32_t, v)) : 0u;
     }
-    return wave_tau_relradix<R>(rk, target, hist, lane);
+    return wave_tau_relradix<R, DPP>(rk, target, hist, lane);
 }
-template <bool COHERENT>
+template <bool COHERENT, bool DPP = true>
 __device__ __forceinline__ float wave_tau(const float* __restrict__ srow, int a, int b, int nvalid, int K, int CAP,
                                           uint32_t* hist, int lane) {
     const int ns = max(b - a, 0);
     const float e = (float)K * (float)ns / (float)max(nvalid, 1);
     const int target = (int)ceilf(e + 5.f * sqrtf(e)) + 8;
     if (nvalid <= CAP || ns < target) return -__builtin_huge_valf();
-    if (ns <= 8 * WARP) return wave_tau_regs<8, COHERENT>(srow, a, b, target, hist, lane);
-    if (ns <= 16 * WARP) return wave_tau_regs<16, COHERENT>(srow, a, b, target, hist, lane);
-    if (ns <= 32 * WARP) return wave_tau_regs<32, COHERENT>(srow, a, b, target, hist, lane);
+    if (ns <= 8 * WARP) return wave_tau_regs<8, COHERENT, DPP>(srow, a, b, target, hist, lane);
+    if (ns <= 16 * WARP) return wave_tau_regs<16, COHERENT, DPP>(srow, a, b, target, hist, lane);
+    if (ns <= 32 * WARP) return wave_tau_regs<32, COHERENT, DPP>(srow, a, b, target, hist, lane);
     if constexpr (COHERENT) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     if (target <= 16 * TAU_STREAM_T) {
         auto ld = [&](int i) -> float { return srow[a + i]; };
-        return wave_tau_stream<TAU_STREAM_T, TAU_STREAM_B>(ld, ns, target, hist, lane);
+        return wave_tau_stream<TAU_STREAM_T, TAU_STREAM_B, DPP>(ld, ns, target, hist, lane);
     }
     constexpr int RT = 32;                          // first RT * 64 samples held in VGPRs (one read), rest re-read
     uint32_t rk[RT];
@@ -431,7 +447,7 @@ __device__ __forceinline__ float wave_tau(const float* __restrict__ srow, int a,
         }
     };
     uint32_t T; int above, ce;
-    wave_radix<4>(each, hist, target, lane, T, above, ce);
+    wave_radix<4, DPP>(each, hist, target, lane, T, above, ce);
     return __builtin_bit_cast(float, okey32_inv(T));
 }
 
@@ -550,7 +566,7 @@ __global__ __launch_bounds__(256) void tau_kernel(const float* __restrict__ ls, 
     const int ksm = max(ks_p[m], 0), kem = min(ke_p[m], N);
     const int nvalid = kem - ksm;
     const int a = FMT_CDIV(ksm, S), b = kem > 0 ? min(FMT_CDIV(kem, S), Ns) : 0;
-    const float t = wave_tau<false>(ls + (int64_t)m * Ns, a, b, nvalid, K, CAP, hist_all[w], lane);
+    const float t = wave_tau<false, false>(ls + (int64_t)m * Ns, a, b, nvalid, K, CAP, hist_all[w], lane);   // shuffle find256: high occupancy
     if (lane == 0) tau[m] = t;
 }
 
@@ -562,7 +578,7 @@ __global__ __launch_bounds__(256) void tau_kernel(const float* __restrict__ ls, 
 // (need_s = min(K, nvalid_s), written by the scan itself).
 // taus != nullptr (with need): exact pre-filter - every split with need_s == K holds >= K keys >= tau_s, so the row's
 // K-th largest is >= max of those tau_s; candidates below it are dropped (keys 0) before the search.
-template <int RC, bool COHERENT>
+template <int RC, bool COHERENT, bool DPP = true>
 __device__ __forceinline__ bool wave_select_row(const unsigned long long* __restrict__ cand, const int* __restrict__ cnt,
                                                 int nsplit, int CAP, int M, int m, int ks, int nvalid, int K,
                                                 int* __restrict__ orow, uint32_t* hist, int lane,
@@ -650,8 +666,8 @@ __device__ __forceinline__ bool wave_select_row(const unsigned long long* __rest
         for (int i0 = RC * WARP; i0 < C; i0 += WARP) { const int i = i0 + lane; const unsigned long long d = ldc(i); const uint32_t k = keyf(d); if (i < C && k) f(k, (int)(d >> 32)); }
     };
     uint32_t T; int above, ce;
-    if (C <= RC * WARP) wave_select_relradix(rk, K, hist, lane, T, above, ce);
-    else wave_radix<4>(each, hist, K, lane, T, above, ce);
+    if (C <= RC * WARP) wave_select_relradix<RC, DPP>(rk, K, hist, lane, T, above, ce);
+    else wave_radix<4, DPP>(each, hist, K, lane, T, above, ce);
     wave_emit([&](auto&& g) {
         #pragma unroll
         for (int j = 0; j < RC; ++j) if (j * WARP < C) g(j * WARP + lane < C, rk[j], rc[j]);
@@ -665,7 +681,7 @@ __device__ __forceinline__ bool wave_select_row(const unsigned long long* __rest
 }
 
 // RC from the candidate count of the row (wave-uniform): fewer registers to compare in every search step
-template <bool COHERENT>
+template <bool COHERENT, bool DPP = true>
 __device__ __forceinline__ bool wave_select_row_auto(const unsigned long long* __restrict__ cand, const int* __restrict__ cnt,
                                                      int nsplit, int CAP, int M, int m, int ks, int nvalid, int K,
                                                      int* __restrict__ orow, uint32_t* hist, int lane,
@@ -678,10 +694,10 @@ __device__ __forceinline__ bool wave_select_row_auto(const unsigned long long* _
     int C = min(c_l, CAP);
     #pragma unroll
     for (int d = 32; d >= 1; d >>= 1) C += __shfl_xor(C, d);
-    if (C <= 16 * WARP) return wave_select_row<16, COHERENT>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus);
-    if (C <= 24 * WARP) return wave_select_row<24, COHERENT>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus);
-    if (C <= 32 * WARP) return wave_select_row<32, COHERENT>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus, surv);
-    return wave_select_row<48, COHERENT>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus);
+    if (C <= 16 * WARP) return wave_select_row<16, COHERENT, DPP>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus);
+    if (C <= 24 * WARP) return wave_select_row<24, COHERENT, DPP>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus);
+    if (C <= 32 * WARP) return wave_select_row<32, COHERENT, DPP>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus, surv);
+    return wave_select_row<48, COHERENT, DPP>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, orow, hist, lane, need, taus);
 }
 
 template <int RC, bool SURVIVORS = false>
@@ -694,7 +710,7 @@ __global__ __launch_bounds__(256) void select_kernel(const unsigned long long* _
     const int lane = threadIdx.x % WARP, w = threadIdx.x / WARP, m = blockIdx.x * 4 + w;
     if (m >= M) return;
     const int ks = max(ks_p[m], 0), nvalid = min(ke_p[m], N) - ks;
-    if (!wave_select_row_auto<false>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, out + (int64_t)m * K, hist_all[w], lane, need, taus,
+    if (!wave_select_row_auto<false, false>(cand, cnt, nsplit, CAP, M, m, ks, nvalid, K, out + (int64_t)m * K, hist_all[w], lane, need, taus,
                                      SURVIVORS ? surv_all[w] : nullptr))
         if (lane == 0) flag[atomicAdd(fbc, 1)] = m;
 }
