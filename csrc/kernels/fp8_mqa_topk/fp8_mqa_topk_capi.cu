@@ -162,6 +162,15 @@ int fmt_fused_nsb(int N, int split, int S) {   // split 0 samples the whole bloc
     (void)split;
     return FMT_CDIV((FMT_CDIV(N, 64) + 1) * 64, S) + 2;
 }
+static int device_cus() {   // resident 8-wave WGs of the fused kernel: one per CU
+    static int cus = 0;
+    if (!cus) { int dev = 0; hipGetDevice(&dev); hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, dev); }
+    return cus;
+}
+// SplitN > 1 (distributed sampling): records per (chunk, row) segment; chunk c = split c's <= ceil(tiles / split) stages
+int fmt_fused_nsbc(int N, int split, int S) {
+    return FMT_CDIV(FMT_CDIV(FMT_CDIV(N, 64) + 1, split) * 64, S) + 2;
+}
 #ifdef FMT_TS
 static long long* g_ts = nullptr;
 int fmt_set_ts(void* p) { g_ts = (long long*)p; return 0; }
@@ -169,13 +178,15 @@ int fmt_set_ts(void* p) { g_ts = (long long*)p; return 0; }
 static FusedArgs make_args(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke,
                            int M, int N, int split, int S, int K, int cap, int nsb, unsigned long long* smp,
                            unsigned long long* cand, int* cnt, float* tau, int* tau_ready, int epoch, int* out, int* flag,
-                           int* fbc, int* block_done, int* ctr, float* fscratch, int* nfb, int dbg) {
+                           int* fbc, int* block_done, int* ctr, float* fscratch, int* nfb, int dbg, int nsbc, int* sflag,
+                           int* scnt, int* tflag, int g_res) {
     FusedArgs a;
     a.Q = (fp8p)q; a.K = (fp8p)k; a.kv_scale = sc; a.W = w; a.ks = ks; a.ke = ke;
     a.M = M; a.N = N; a.SplitN = split; a.S = S; a.Ktop = K; a.CAP = cap; a.NSB = nsb; a.rb = FMT_CDIV(M, 32);
     a.smp = smp; a.cand = cand; a.cnt = cnt; a.tau = tau; a.tau_ready = tau_ready; a.epoch = epoch;
     a.out = out; a.flag = flag; a.fbc = fbc;
     a.block_done = block_done; a.ctr = ctr; a.fscratch = fscratch; a.nfb = nfb; a.dbg = dbg;
+    a.NSBc = nsbc; a.sflag = sflag; a.scnt = scnt; a.tflag = tflag; a.Gres = g_res;
 #ifdef FMT_TS
     a.ts = g_ts;
 #endif
@@ -186,14 +197,21 @@ static FusedArgs make_args(const void* q, const void* k, const float* sc, const 
 // smp: float[split * M * nsb], cand: u64[split * Mp * cap], cnt / need: int[split * M], done: int[64] zeroed once.
 int fmt_step2(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke, int M, int N,
               int split, int rev, int S, int K, int cap, int nsb, unsigned long long* smp, unsigned long long* cand, int* cnt,
-              float* tau, int* tau_ready, int epoch, int* out, int* flag, int* fbc, int* done, float* scratch, int* nfb, int dbg, hipStream_t st) {
+              float* tau, int* tau_ready, int epoch, int* out, int* flag, int* fbc, int* done, float* scratch, int* nfb, int dbg,
+              int nsbc, int* sflag, int* scnt, int* tflag, hipStream_t st) {
     if (M <= 0 || N <= 0) return 0;
     if (split < 1 || split > 16) return -5;
     FusedArgs a = make_args(q, k, sc, w, ks, ke, M, N, split, S, K, cap, nsb, smp, cand, cnt, tau, tau_ready, epoch, out, flag, fbc,
-                            nullptr, nullptr, nullptr, nfb, dbg);
+                            nullptr, nullptr, nullptr, nfb, dbg, nsbc, sflag, scnt, tflag, device_cus());
     dim3 grid(a.rb, split);
-    if (rev) fused_kernel<false, false, true><<<grid, FUSED_THREADS, 0, st>>>(a);
-    else     fused_kernel<false, false, false><<<grid, FUSED_THREADS, 0, st>>>(a);
+    const bool dist = split > 1 && ((split >= 4 && a.rb * split <= device_cus()) || (dbg & 8));   // distributed sampling: >= 4 splits, grid fits (dbg 8: test hook)
+    if (dist) {
+        if (rev) fused_kernel<false, false, true, true><<<grid, FUSED_THREADS, 0, st>>>(a);
+        else     fused_kernel<false, false, false, true><<<grid, FUSED_THREADS, 0, st>>>(a);
+    } else {
+        if (rev) fused_kernel<false, false, true><<<grid, FUSED_THREADS, 0, st>>>(a);
+        else     fused_kernel<false, false, false><<<grid, FUSED_THREADS, 0, st>>>(a);
+    }
     if (dbg & 2) return (int)hipGetLastError();     // debug: fused kernel only
     select_kernel<32><<<FMT_CDIV(M, 4), 256, 0, st>>>(cand, cnt, split, cap, ks, ke, M, N, K, out, flag, fbc);
     fallback1_kernel<<<64, 256, 0, st>>>(flag, fbc, done, ks, ke, M, N, K, out, scratch, (fp8p)q, (fp8p)k, sc, w, nfb);
@@ -205,14 +223,20 @@ int fmt_step2(const void* q, const void* k, const float* sc, const float* w, con
 int fmt_step3(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke, int M, int N,
               int split, int rev, int S, int K, int cap, int nsb, unsigned long long* smp, unsigned long long* cand, int* cnt,
               float* tau, int* tau_ready, int epoch, int* out, int* flag, int* fbc, int* block_done, int* done, int* fb_exit, float* scratch,
-              int* nfb, int dbg, hipStream_t st) {
+              int* nfb, int dbg, int nsbc, int* sflag, int* scnt, int* tflag, hipStream_t st) {
     if (M <= 0 || N <= 0) return 0;
     if (split < 1 || split > 16) return -5;
     FusedArgs a = make_args(q, k, sc, w, ks, ke, M, N, split, S, K, cap, nsb, smp, cand, cnt, tau, tau_ready, epoch, out, flag, fbc,
-                            block_done, nullptr, nullptr, nfb, dbg);
+                            block_done, nullptr, nullptr, nfb, dbg, nsbc, sflag, scnt, tflag, device_cus());
     dim3 grid(a.rb, split);
-    if (rev) fused_kernel<true, false, true><<<grid, FUSED_THREADS, 0, st>>>(a);
-    else     fused_kernel<true, false, false><<<grid, FUSED_THREADS, 0, st>>>(a);
+    const bool dist = split > 1 && ((split >= 4 && a.rb * split <= device_cus()) || (dbg & 8));
+    if (dist) {
+        if (rev) fused_kernel<true, false, true, true><<<grid, FUSED_THREADS, 0, st>>>(a);
+        else     fused_kernel<true, false, false, true><<<grid, FUSED_THREADS, 0, st>>>(a);
+    } else {
+        if (rev) fused_kernel<true, false, true><<<grid, FUSED_THREADS, 0, st>>>(a);
+        else     fused_kernel<true, false, false><<<grid, FUSED_THREADS, 0, st>>>(a);
+    }
     fallback1_kernel<<<64, 256, 0, st>>>(flag, fbc, done, ks, ke, M, N, K, out, scratch, (fp8p)q, (fp8p)k, sc, w, nfb, fb_exit);
     return (int)hipGetLastError();
 }
@@ -222,13 +246,14 @@ int fmt_step3(const void* q, const void* k, const float* sc, const float* w, con
 int fmt_step4(const void* q, const void* k, const float* sc, const float* w, const int* ks, const int* ke, int M, int N,
               int split, int S, int K, int cap, int nsb, int G, unsigned long long* smp, unsigned long long* cand, int* cnt,
               float* tau, int* tau_ready, int epoch, int* out, int* flag, int* fbc, int* block_done, int* ctr, float* fscratch, int* nfb,
-              int dbg, hipStream_t st) {
+              int dbg, int nsbc, int* sflag, int* scnt, int* tflag, hipStream_t st) {
     if (M <= 0 || N <= 0) return 0;
     if (split < 1 || split > 16) return -5;
     FusedArgs a = make_args(q, k, sc, w, ks, ke, M, N, split, S, K, cap, nsb, smp, cand, cnt, tau, tau_ready, epoch, out, flag, fbc,
-                            block_done, ctr, fscratch, nfb, dbg);
+                            block_done, ctr, fscratch, nfb, dbg, nsbc, sflag, scnt, tflag, 0);
     const int items = a.rb * split;
     if (G > items) G = items;
+    a.Gres = G;
     fused_kernel<true, true, false><<<G, FUSED_THREADS, 0, st>>>(a);
     return (int)hipGetLastError();
 }

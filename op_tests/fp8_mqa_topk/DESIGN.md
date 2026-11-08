@@ -120,7 +120,9 @@ Modes (compile-time):
   `s_waitcnt vmcnt(0)` in every wave -> WG barrier -> one agent-scope atomic by one lane (acq_rel counter, or release
   store of the launch epoch) -> broadcast through LDS -> acquire fence in every reading wave. Spin-waits poll with
   RELAXED agent-scope loads and acquire once after the barrier (an acquire load per poll emits `buffer_inv sc1` per
-  iteration and slowed the producers 2-4x). sc0 = workgroup scope, sc1 = agent scope.
+  iteration and slowed the producers 2-4x). sc0 = workgroup scope, sc1 = agent scope. Every release is written by
+  hand (`FMT_RELEASE_AGENT()`: vmcnt(0) -> buffer_wbl2 sc1 -> vmcnt(0)) before a relaxed store / acquire RMW: the
+  compiler drops the wait after its own buffer_wbl2 when its scoreboard is empty (tools/wbl2check.py).
 * Counters (fallback count, split-completion counters, persistent claim/done counters) live in a small int32
   workspace zeroed ONCE at allocation; whoever consumes a counter resets it to 0 for the next launch (no memset
   launches).
@@ -138,6 +140,10 @@ Modes (compile-time):
   runs the sample pass through the same EV4 emission pipeline (key stride S, records into `smp`) over the whole block
   range, computes tau per row and publishes it (release store of the launch epoch in `tau_ready[bx]`); the other
   splits poll and acquire. Then the masked and clean EMIT pipelines. -> 3 launches (fused, select, fallback1).
+  Since 2026-11-08 there are two compiled variants (template flag `DIST`). The plain variant is the scheme above; for
+  SplitN >= 4 grids that fit on the GPU, the distributed variant samples each split's key range in parallel
+  (claimable chunks, work stealing), spreads the block's rows over all splits' waves for tau, and publishes per-row
+  flags - see PROGRESS.md 2026-11-08 for the protocol and its measured trade-offs.
 * **Step 3**: FUSE_SELECT: after its EMIT pipelines a WG writes its counts; SplitN == 1 -> it selects its 32 rows
   directly (8 waves x 4 rows); SplitN > 1 -> release fence + atomic on block_done[b]; the last split acquires and
   selects (reads all splits' segments after the acquire). Flagged rows -> fallback list -> fallback kernel. -> 2

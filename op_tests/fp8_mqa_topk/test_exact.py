@@ -24,13 +24,22 @@ FULL = QUICK + [
 ]
 
 
+# forced SplitN (steps 2-4): rb * SplitN far above the 256 resident WGs -> early WGs steal the sample chunks of WGs that
+# are not dispatched yet (work stealing / no co-residency assumption)
+STEAL = [  # (M, N, kind, reqs, causal, split)
+    (4096, 24000, "rand", 1, True, 8), (2048, 20000, "rand", 2, True, 16), (16384, 8192, "rand", 1, True, 4),
+    (777, 9000, "ties", 1, False, 12),
+    (1001, 9000, "rand", 1, True, 1), (1002, 20000, "rand", 1, True, 1),   # SplitN 1 with M % 4 in {1, 2}
+]
+
+
 def make_step(step, **kw):
     return {0: S.Step0, 1: S.Step1, 2: S.Step2, 3: S.Step3, 4: S.Step4}[step](**kw)
 
 
 def poison(st):
     """Fill every workspace buffer of a step with garbage before a call (stale-state bugs must not pass)."""
-    for name in ("ls", "tau", "cand", "cnt", "flag", "scratch", "smp", "fscratch"):
+    for name in ("ls", "tau", "cand", "cnt", "flag", "scratch", "smp", "fscratch", "scnt"):
         t = getattr(st, name, None)
         if t is not None:
             if t.dtype.is_floating_point:
@@ -114,7 +123,9 @@ def run_case(step, M, N, kind, reqs, causal, force_fb=False, split=None):
     S.dense(q8, k8, sc, w, ks, ke, mine)
     win = torch.isfinite(lg)
     res["dense_bitexact"] = bool((mine[win].view(torch.int32) == lg[win].view(torch.int32)).all())
-    st = make_step(step)
+    st = make_step(step, split=split) if (split and step >= 2) else make_step(step)
+    if split and split > 1 and step >= 2:
+        st.dbg_bits = 8 | 16   # distributed variant with one chunk per split even though the grid exceeds the GPU
     if force_fb:
         st.force_fallback = True
     out = torch.full((M, F.TOPK), -7, dtype=torch.int32, device="cuda")
@@ -146,6 +157,14 @@ def main():
         bad += not ok
         print(f"{'OK ' if ok else 'BAD'} {c}: wrong {r['wrong_rows']} dense_bitexact {r['dense_bitexact']} split {r['split']} "
               f"cand {r['cand_mean']:.0f}/{r['cand_max']} tau=-inf {r['tau_ninf']} fallback {r['fallback_rows']} ({time.time()-t0:.1f}s)", flush=True)
+    if a.step >= 2:
+        for c in STEAL:
+            r = run_case(a.step, *c[:5], split=c[5])
+            allres.append(r)
+            ok = r["wrong_rows"] == 0 and r["dense_bitexact"]
+            bad += not ok
+            print(f"{'OK ' if ok else 'BAD'} forced-split {c}: wrong {r['wrong_rows']} split {r['split']} "
+                  f"cand {r['cand_mean']:.0f}/{r['cand_max']} fallback {r['fallback_rows']}", flush=True)
     # forced fallback on a few shapes (every row through the exact recompute path)
     for c in [(512, 12000, "rand", 1, True), (300, 5000, "ties", 1, True), (130, 70000, "rand", 2, True)]:
         r = run_case(a.step, *c, force_fb=True)

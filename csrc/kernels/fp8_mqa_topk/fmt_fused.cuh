@@ -41,13 +41,21 @@ struct FusedArgs {
     int* ctr;                       // PERSIST: [0] claim, [1] items-done barrier, [2] fallback claim, [3] exit
     float* fscratch;                // PERSIST: [G][N] per-WG fallback row
     int* nfb;                       // optional: fallback rows counter (stats)
+    int NSBc;                       // SplitN > 1: sample records per (chunk, row) segment ([SplitN][Mp][NSBc] layout)
+    int Gres;                       // WGs that can be resident at once (CUs; persistent: G). rb * SplitN <= Gres ->
+                                    // distributed chunks; else ONE chunk (whole range, NSB records) and 4 rows per wave
+    int* sflag;                     // SplitN > 1: [2][rb][SplitN] chunk claim / chunk sampled flags (epoch-valued)
+    int* scnt;                      // SplitN > 1: [SplitN][M] samples per (chunk, row)
+    int* tflag;                     // SplitN > 1: [2][rb][32] row-tau claim / published flags (epoch-valued)
     int dbg;                        // bit 0: tau = +inf (forces every non-empty row through the exact fallback);
-                                    // bit 2: tau = -inf (debug: emit every valid key)
+                                    // bit 1: fused kernel only; bit 2: tau = -inf (debug: emit every valid key);
+                                    // bit 3: DIST variant for any SplitN > 1 grid; bit 4: one chunk per split always
+                                    // (bits 3-4: test hooks that make WGs steal chunks of WGs not yet dispatched)
 #ifdef FMT_TS
     long long* ts;                  // debug probe: [bx][s][8] s_memrealtime at phase ends (wave 0)
 #endif
 };
-#ifdef FMT_TS
+#if defined(FMT_TS) && !defined(FMT_DBGTAU)
 #define FMT_TSP(k) do { if (A.ts && tid == 0) A.ts[((int64_t)bx * SplitN + s) * 8 + (k)] = (long long)__builtin_amdgcn_s_memrealtime(); } while (0)
 #else
 #define FMT_TSP(k) do {} while (0)
@@ -80,7 +88,7 @@ __device__ __noinline__ bool fused_select_row(const unsigned long long* cand, co
 // One (row block, split) item: Q/W load -> (split 0) row-wide sample + tau -> EMIT -> counts -> (FUSE_SELECT)
 // completion + select. Inlined into the grid kernels (steps 2-3); behind a call in the persistent kernel (step 4),
 // where the claim loop's live state would otherwise push the 256-VGPR body into spills inside the pipelines.
-template <bool FUSE_SELECT, bool PERSIST>
+template <bool FUSE_SELECT, bool PERSIST, bool DIST>
 __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx_in, const int s_in, const int slot_in)
 {
     // behind a call the arguments (and everything loaded through A) arrive in VGPRs: make the scalars uniform (SGPR)
@@ -421,30 +429,101 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
 #undef SUBTILE
     };
 
-    // ---- 1-2. ROW-WIDE tau: split 0 samples the block's whole key range (keys j*S as records) and publishes tau
-    // per row; the other splits of the block wait for it (they are dispatched / claimed after split 0, so the wait
-    // cannot deadlock). Per-split taus would make every split target the full K (SplitN x the candidates).
-    if (s == 0) {
-        const int tokr_e = min(lo + num_tiles * STAGE_TOK, N);
-        const int jr_b = FMT_CDIV(lo, S), jr_e = FMT_CDIV(tokr_e, S);
+    // ---- 1-2. ROW-WIDE tau. Two compiled variants, chosen per launch by the host:
+    //   DIST == false: split 0 samples the block's whole range and publishes tau (tau_ready); used when SplitN == 1 or
+    //     the grid does not fit on the GPU (split-0 WGs then run first anyway) and by the persistent kernel.
+    //   DIST == true : distributed chunks + distributed tau rows (below); used for SplitN > 1 grids that fit. The
+    //     distributed code costs registers in the shared scan loop (SGPR spills), so it only exists in this variant.
+    if constexpr (DIST) {
+        // ---- 1-2. ROW-WIDE tau from a 1/S strided sample of the block's key range ----
+        // SplitN == 1: the WG samples its whole range into rows srow0 (one chunk, no claims), then every wave computes its
+        //   4 rows' tau in lockstep.
+        // SplitN > 1 (DISTRIBUTED): chunk c = split c's key range, sampled into its own segment ([c][Mp][NSBc]) with
+        //   per-row counts scnt[c][m]. Chunks are claimed by atomic exchange of the launch epoch - own chunk first, then
+        //   any unclaimed one (work stealing) - so a WG only ever waits for chunks a RUNNING WG has claimed: no
+        //   co-residency assumption, no deadlock. When every chunk of the block is done, the waves of all splits claim the
+        //   block's rows (R per wave: ~one per wave when SplitN >= 4) and compute their tau over all segments, publishing
+        //   A.tau[m] and a per-row done flag; each wave then waits for its own 4 rows. Every flag holds the epoch of the
+        //   launch that set it (never reset). Hand-offs: vmcnt(0) in every wave -> barrier -> release by one lane;
+        //   consumers poll relaxed and acquire once.
+        const int epoch = __builtin_amdgcn_readfirstlane(A.epoch);
+        const bool dist = SplitN > 1;
+        // all splits of a block resident together (expected)? -> one chunk per split; else the first WG of the block to
+        // arrive samples the whole range as one chunk (the others start later and find it done) - stealing keeps both
+        // correct whatever the actual residency
+        const bool corez = dist && ((int64_t)__builtin_amdgcn_readfirstlane(A.rb) * SplitN <= __builtin_amdgcn_readfirstlane(A.Gres)
+                                    || (A.dbg & 16));   // dbg 16 (test hook): one chunk per split even for oversized grids
+        const int nck = corez ? SplitN : 1;
+        const int ckcap = corez ? __builtin_amdgcn_readfirstlane(A.NSBc) : NSB;
+        const int pck = FMT_CDIV(num_tiles, nck);
+        int* const s_claim = A.sflag + (int64_t)bx * SplitN;
+        int* const s_done  = A.sflag + ((int64_t)A.rb + bx) * SplitN;
         const int64_t srow0 = PERSIST ? (int64_t)slot * ROWS_WG + (m0 - m0wg) : (int64_t)m0;
-        if (jr_e > jr_b) {
-            #pragma unroll
-            for (int r = 0; r < BLOCK_M; r += 2) {   // sample index window of my row of the pair
-                int ksa, kea, ksb, keb;
-                const bool oka = row_win(r, ksa, kea), okb = row_win(r + 1, ksb, keb);
-                const int la = max(ksa > 0 ? FMT_CDIV(ksa, S) : 0, jr_b), ha = oka ? min(kea > 0 ? FMT_CDIV(kea, S) : 0, jr_e) : jr_b;
-                const int lb = max(ksb > 0 ? FMT_CDIV(ksb, S) : 0, jr_b), hb = okb ? min(keb > 0 ? FMT_CDIV(keb, S) : 0, jr_e) : jr_b;
-                p_lo[r / 2] = hset ? lb : la; p_hi[r / 2] = hset ? hb : ha; p_tau[r / 2] = -__builtin_huge_valf();
+        {
+            int c = corez ? s : 0;                 // own chunk first
+            #pragma unroll 1
+            while (c >= 0) {
+                bool mine = true;
+                if (dist) {                         // WG-uniform claim: atomic exchange of the epoch by one lane
+                    if (tid == 0) bcast = (__hip_atomic_exchange(&s_claim[c], epoch, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != epoch);
+                    __syncthreads();
+                    mine = bcast != 0;
+                    __syncthreads();
+                }
+                if (mine) {
+                    const int sbc = min(c * pck, num_tiles), sec = min(sbc + pck, num_tiles);
+                    const int jb = FMT_CDIV(min(lo + sbc * STAGE_TOK, N), S), je = FMT_CDIV(min(lo + sec * STAGE_TOK, N), S);
+                    if (je > jb) {
+                        #pragma unroll
+                        for (int r = 0; r < BLOCK_M; r += 2) {   // sample index window of my row of the pair
+                            int ksa, kea, ksb, keb;
+                            const bool oka = row_win(r, ksa, kea), okb = row_win(r + 1, ksb, keb);
+                            const int la = max(ksa > 0 ? FMT_CDIV(ksa, S) : 0, jb), ha = oka ? min(kea > 0 ? FMT_CDIV(kea, S) : 0, je) : jb;
+                            const int lb = max(ksb > 0 ? FMT_CDIV(ksb, S) : 0, jb), hb = okb ? min(keb > 0 ? FMT_CDIV(keb, S) : 0, je) : jb;
+                            p_lo[r / 2] = hset ? lb : la; p_hi[r / 2] = hset ? hb : ha; p_tau[r / 2] = -__builtin_huge_valf();
+                        }
+                        ob_cur = dist ? A.smp + (int64_t)c * Mp * ckcap : A.smp;
+                        orow0 = dist ? (int64_t)m0 : srow0;
+                        ocap_cur = dist ? ckcap : NSB; kvm = S;
+                        const int lo_s = jb & ~(TILE_N - 1);
+                        const int nst = FMT_CDIV(je - lo_s, STAGE_TOK);
+                        run_pipeline(std::true_type{}, 0, nst, lo_s, nst, nst);
+                    }
+                    wait_vmcnt<0>();
+                    if (dist) {                     // publish the chunk: counts, then its done flag
+                        if (l == 0) {
+                            #pragma unroll
+                            for (int r = 0; r < BLOCK_M; ++r)
+                                if (m0 + r < M) A.scnt[(int64_t)c * M + m0 + r] = cnt_row[r];
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < BLOCK_M; ++r) cnt_row[r] = 0;
+                        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                        __syncthreads();
+                        if (tid == 0) { FMT_RELEASE_AGENT(); __hip_atomic_store(&s_done[c], epoch, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); }
+                    }
+                }
+                if (!dist) break;
+                // next unclaimed chunk (lowest index), decided by wave 0 and broadcast: it must be WG-UNIFORM (each wave
+                // reading the flags itself saw different claim states -> waves skipped the claimed chunk and the WG's
+                // barriers fell out of step: missing counts, and a deadlock at 16 splits)
+                if (warp == 0) {
+                    int cn = -1;
+                    for (int base = 0; base < nck && cn < 0; base += WARP) {
+                        const int cc = base + l;
+                        const int v = cc < nck ? __hip_atomic_load(&s_claim[cc], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : epoch;
+                        const uint64_t un = __ballot(v != epoch);
+                        if (un) cn = base + (int)__builtin_ctzll(un);
+                    }
+                    if (l == 0) bcast = cn;
+                }
+                __syncthreads();
+                c = __builtin_amdgcn_readfirstlane(bcast);
+                __syncthreads();
             }
-            ob_cur = A.smp; orow0 = srow0; ocap_cur = NSB; kvm = S;
-            const int lo_s = jr_b & ~(TILE_N - 1);
-            const int nst = FMT_CDIV(jr_e - lo_s, STAGE_TOK);
-            run_pipeline(std::true_type{}, 0, nst, lo_s, nst, nst);
         }
-        wait_vmcnt<0>();
         FMT_TSP(1);
-        {   // tau of the wave's 4 rows in lockstep (same-wave read-after-write of its own records)
+        if (!dist) {   // tau of the wave's 4 rows in lockstep (same-wave read-after-write of its own records)
             int ns_r[BLOCK_M], tgt[BLOCK_M];
             bool act[BLOCK_M], okr[BLOCK_M];
             #pragma unroll
@@ -459,8 +538,10 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
             float t4[BLOCK_M];
             const uint32_t* rowp[BLOCK_M];
             #pragma unroll
-            for (int q = 0; q < BLOCK_M; ++q)   // record i of row q at A.smp[(srow0 + (q & ~1)) * NSB + 2 i + (q & 1)]
-                rowp[q] = reinterpret_cast<const uint32_t*>(A.smp + (srow0 + (q & ~1)) * NSB + (q & 1));
+            for (int q = 0; q < BLOCK_M; ++q) {   // record i of row q at A.smp[(srow0 + (q & ~1)) * NSB + 2 i + (q & 1)]
+                const int pq = (m0 + (q & ~1) < M) ? (q & ~1) : 0;   // pair past M (M % 4 in {1, 2}): valid base, masked
+                rowp[q] = reinterpret_cast<const uint32_t*>(A.smp + (srow0 + pq) * NSB + (q & 1));
+            }
             wave_tau_multi<BLOCK_M, FMT_TAU_B>(rowp, 0, [&](int q, int) -> int { return ns_r[q]; }, 1, act, tgt, hist, l, t4);
             #pragma unroll 1
             for (int r = 0; r < BLOCK_M; ++r) {
@@ -478,25 +559,212 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
                 if (okr[r] && l == 0) A.tau[m0 + r] = t;
                 if (hset == (r & 1)) p_tau[r / 2] = t;   // lanes of row r in its pair
             }
-        }
-        if (SplitN > 1) {
-            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-            __syncthreads();
-            if (tid == 0) __hip_atomic_store(&A.tau_ready[bx], A.epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        } else {
+            int* const t_claim = A.tflag + (int64_t)bx * ROWS_WG;
+            int* const t_done  = A.tflag + ((int64_t)A.rb + bx) * ROWS_WG;
+    #ifndef FMT_EXP_NO_DTAU
+            // every chunk of the block sampled? (each wave polls all done flags itself, then acquires)
+            for (int base = 0; base < nck; base += WARP) {
+                const int cc = base + l;
+                if (cc < nck)
+                    while (__hip_atomic_load(&s_done[cc], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != epoch)
+                        __builtin_amdgcn_s_sleep(FMT_SPIN_SLEEP);
+            }
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+            // per-row sample count over all segments (lane = segment, batches of 64)
+            auto seg_cnt = [&](int m, int g) -> int {   // relaxed agent load: written by other WGs, acquired above
+                return g < nck ? __hip_atomic_load(&A.scnt[(int64_t)g * M + m], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : 0;
+            };
+            const int R = corez ? min(max(FMT_CDIV(ROWS_WG, SplitN * NUM_WARPS), 1), 4) : 4;   // rows per claim
+            const int64_t seg_stride = (int64_t)Mp * ckcap * 2;                                  // u32 between segments
+            auto tau_rows = [&](auto nr_c, auto b_c, const int (&rows)[4]) {
+                constexpr int NR = decltype(nr_c)::value, B = decltype(b_c)::value;
+                int mr[NR], tgt[NR];
+                bool act[NR];
+                const uint32_t* rowp[NR];
+                #pragma unroll
+                for (int q = 0; q < NR; ++q) {
+                    const bool ok = rows[q] >= 0;
+                    const int m = m0wg + (ok ? rows[q] : rows[0]);
+                    mr[q] = m;
+                    int ns = 0;
+                    for (int base = 0; base < nck; base += WARP) ns += wave_sum_dpp(seg_cnt(m, base + l));
+                    const int ksm = max(A.ks[m], 0), kem = min(A.ke[m], N);
+                    tgt[q] = ok ? tau_target(ns, kem - ksm, Ktop) : 0;
+                    act[q] = tgt[q] > 0 && tgt[q] <= 16 * TAU_STREAM_T;
+                    rowp[q] = reinterpret_cast<const uint32_t*>(A.smp + (int64_t)(m & ~1) * ckcap + (m & 1));   // segment 0
+                }
+                // per-segment counts of the rows -> the wave's histogram LDS (free until the radix zeroes it); SplitN <= 16
+                #pragma unroll
+                for (int q = 0; q < NR; ++q)
+                    if (l < nck) hist[q * 64 + l] = (uint32_t)seg_cnt(mr[q], l);
+                mem_fence_wave();
+                auto cntf = [&](int q, int g) -> int {
+                    return __builtin_amdgcn_readfirstlane((int)hist[q * 64 + g]);
+                };
+                float tq[NR];
+    #ifdef FMT_DBGTAU
+                int dk[NR];
+                int tab[NR][16];
+                #pragma unroll
+                for (int q = 0; q < NR; ++q)
+                    for (int g = 0; g < 16; ++g) tab[q][g] = g < nck ? (int)hist[q * 64 + g] : -1;
+                wave_tau_multi<NR, B, false>(rowp, seg_stride, cntf, nck, act, tgt, hist, l, tq, dk);
+                if (A.ts && l == 0) {
+                    #pragma unroll
+                    for (int q = 0; q < NR; ++q) {
+                        if (rows[q] < 0) continue;
+                        long long* d = A.ts + (int64_t)mr[q] * 24;
+                        d[0] = s; d[1] = warp; d[2] = tgt[q]; d[3] = act[q]; d[4] = dk[q]; d[5] = NR; d[6] = __builtin_bit_cast(int, tq[q]);
+                        int ns2 = 0;
+                        for (int g = 0; g < 16; ++g) { d[8 + g] = tab[q][g]; ns2 += tab[q][g] > 0 ? tab[q][g] : 0; }
+                        d[7] = ns2;
+                    }
+                }
+    #else
+                wave_tau_multi<NR, B, false>(rowp, seg_stride, cntf, nck, act, tgt, hist, l, tq);
+    #endif
+                #pragma unroll
+                for (int q = 0; q < NR; ++q) {
+                    if (rows[q] < 0) continue;
+                    float t = tq[q];
+                    if (tgt[q] > 16 * TAU_STREAM_T) t = -__builtin_huge_valf();   // beyond the filter's range: safe -inf
+                    if (A.dbg & 1) t = __builtin_huge_valf();
+                    if (A.dbg & 4) t = -__builtin_huge_valf();
+                    if (l == 0) A.tau[mr[q]] = t;
+                }
+                asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                if (l == 0) {
+                    FMT_RELEASE_AGENT();
+                    #pragma unroll
+                    for (int q = 0; q < NR; ++q)
+                        if (rows[q] >= 0) __hip_atomic_store(&t_done[rows[q]], epoch, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                }
+            };
+            #pragma unroll 1
+            while (true) {   // claim up to R unclaimed rows of the block, compute, publish; until none is left
+                const bool vr = l < ROWS_WG && m0wg + l < M;
+                const int cv = vr ? __hip_atomic_load(&t_claim[l], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : epoch;
+                const uint64_t un = __ballot(cv != epoch);
+                if (!un) break;
+                int rows[4] = {-1, -1, -1, -1};
+                if (l == 0) {
+                    const int rot = ((s * NUM_WARPS + warp) * R) & (ROWS_WG - 1);   // spread the waves over the rows
+                    const uint32_t u32 = (uint32_t)un;
+                    uint32_t rem = (u32 >> rot) | (rot ? (u32 << (ROWS_WG - rot)) : 0u);
+                    int ng = 0;
+                    while (rem && ng < R) {
+                        const int bit = __builtin_ctz(rem);
+                        rem &= rem - 1u;
+                        const int r = (bit + rot) & (ROWS_WG - 1);
+                        if (__hip_atomic_exchange(&t_claim[r], epoch, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != epoch) rows[ng++] = r;
+                    }
+                }
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) rows[q] = __builtin_amdgcn_readfirstlane(rows[q]);
+                if (rows[0] < 0) continue;      // lost every race: re-read the flags
+                if (R == 1) tau_rows(IC<1>{}, IC<32>{}, rows);
+                else if (R == 2) tau_rows(IC<2>{}, IC<16>{}, rows);
+                else tau_rows(IC<4>{}, IC<FMT_TAU_B>{}, rows);
+            }
+            // my 4 rows' tau published? (lanes 0-3 poll, then the wave acquires)
+            if (l < BLOCK_M && m0 + l < M)
+                while (__hip_atomic_load(&t_done[(m0 - m0wg) + l], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != epoch)
+                    __builtin_amdgcn_s_sleep(FMT_SPIN_SLEEP);
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+            #pragma unroll
+            for (int r = 0; r < BLOCK_M; ++r) {
+                const float t = (m0 + r < M) ? __builtin_bit_cast(float, __hip_atomic_load(reinterpret_cast<const int*>(&A.tau[m0 + r]),
+                                                                                              __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) : 0.f;
+                if (hset == (r & 1)) p_tau[r / 2] = t;
+            }
+    #else
+            #pragma unroll
+            for (int r = 0; r < BLOCK_M; ++r) if (hset == (r & 1)) p_tau[r / 2] = -__builtin_huge_valf();
+    #endif
         }
         FMT_TSP(2);
     } else {
-        if (tid == 0) {
-            while (__hip_atomic_load(&A.tau_ready[bx], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != A.epoch) __builtin_amdgcn_s_sleep(FMT_SPIN_SLEEP);
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");   // the observing lane synchronizes-with the release
-        }
-        FMT_TSP(2);
-        __syncthreads();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-        #pragma unroll
-        for (int r = 0; r < BLOCK_M; ++r) {
-            const float t = (m0 + r < M) ? A.tau[m0 + r] : 0.f;
-            if (hset == (r & 1)) p_tau[r / 2] = t;
+        // ---- 1-2. ROW-WIDE tau: split 0 samples the block's whole key range (keys j*S as records) and publishes tau
+        // per row; the other splits of the block wait for it (they are dispatched / claimed after split 0, so the wait
+        // cannot deadlock). Per-split taus would make every split target the full K (SplitN x the candidates).
+        if (s == 0) {
+            const int tokr_e = min(lo + num_tiles * STAGE_TOK, N);
+            const int jr_b = FMT_CDIV(lo, S), jr_e = FMT_CDIV(tokr_e, S);
+            const int64_t srow0 = PERSIST ? (int64_t)slot * ROWS_WG + (m0 - m0wg) : (int64_t)m0;
+            if (jr_e > jr_b) {
+                #pragma unroll
+                for (int r = 0; r < BLOCK_M; r += 2) {   // sample index window of my row of the pair
+                    int ksa, kea, ksb, keb;
+                    const bool oka = row_win(r, ksa, kea), okb = row_win(r + 1, ksb, keb);
+                    const int la = max(ksa > 0 ? FMT_CDIV(ksa, S) : 0, jr_b), ha = oka ? min(kea > 0 ? FMT_CDIV(kea, S) : 0, jr_e) : jr_b;
+                    const int lb = max(ksb > 0 ? FMT_CDIV(ksb, S) : 0, jr_b), hb = okb ? min(keb > 0 ? FMT_CDIV(keb, S) : 0, jr_e) : jr_b;
+                    p_lo[r / 2] = hset ? lb : la; p_hi[r / 2] = hset ? hb : ha; p_tau[r / 2] = -__builtin_huge_valf();
+                }
+                ob_cur = A.smp; orow0 = srow0; ocap_cur = NSB; kvm = S;
+                const int lo_s = jr_b & ~(TILE_N - 1);
+                const int nst = FMT_CDIV(jr_e - lo_s, STAGE_TOK);
+                run_pipeline(std::true_type{}, 0, nst, lo_s, nst, nst);
+            }
+            wait_vmcnt<0>();
+            FMT_TSP(1);
+            {   // tau of the wave's 4 rows in lockstep (same-wave read-after-write of its own records)
+                int ns_r[BLOCK_M], tgt[BLOCK_M];
+                bool act[BLOCK_M], okr[BLOCK_M];
+                #pragma unroll
+                for (int r = 0; r < BLOCK_M; ++r) {
+                    int ksc, kec;
+                    okr[r] = row_win(r, ksc, kec);
+                    ns_r[r] = cnt_row[r];
+                    cnt_row[r] = 0;
+                    tgt[r] = okr[r] ? tau_target(ns_r[r], kec - ksc, Ktop) : 0;
+                    act[r] = tgt[r] > 0 && tgt[r] <= 16 * TAU_STREAM_T;
+                }
+                float t4[BLOCK_M];
+                const uint32_t* rowp[BLOCK_M];
+                #pragma unroll
+                for (int q = 0; q < BLOCK_M; ++q) {   // record i of row q at A.smp[(srow0 + (q & ~1)) * NSB + 2 i + (q & 1)]
+                    const int pq = (m0 + (q & ~1) < M) ? (q & ~1) : 0;   // pair past M (M % 4 in {1, 2}): valid base, masked
+                    rowp[q] = reinterpret_cast<const uint32_t*>(A.smp + (srow0 + pq) * NSB + (q & 1));
+                }
+                wave_tau_multi<BLOCK_M, FMT_TAU_B>(rowp, 0, [&](int q, int) -> int { return ns_r[q]; }, 1, act, tgt, hist, l, t4);
+                #pragma unroll 1
+                for (int r = 0; r < BLOCK_M; ++r) {
+                    float t = t4[r];
+                    if (tgt[r] > 16 * TAU_STREAM_T) {   // target beyond the per-lane filter's range (not hit at S = 32)
+                        int ksc, kec;
+                        row_win(r, ksc, kec);
+                        const unsigned long long* rec = A.smp + (srow0 + (r & ~1)) * NSB + (r & 1);
+                        t = wave_tau_ld([&](int i) -> float { return __builtin_bit_cast(float, (unsigned)rec[2 * i]); },
+                                        ns_r[r], kec - ksc, Ktop, hist, l);
+                    }
+                    if (A.dbg & 1) t = __builtin_huge_valf();
+                    if (A.dbg & 4) t = -__builtin_huge_valf();   // debug: every valid key a candidate (needs CAP >= keys/split)
+                    t = __builtin_bit_cast(float, __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int, t)));
+                    if (okr[r] && l == 0) A.tau[m0 + r] = t;
+                    if (hset == (r & 1)) p_tau[r / 2] = t;   // lanes of row r in its pair
+                }
+            }
+            if (SplitN > 1) {
+                asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                __syncthreads();
+                if (tid == 0) { FMT_RELEASE_AGENT(); __hip_atomic_store(&A.tau_ready[bx], A.epoch, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); }
+            }
+            FMT_TSP(2);
+        } else {
+            if (tid == 0) {
+                while (__hip_atomic_load(&A.tau_ready[bx], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != A.epoch) __builtin_amdgcn_s_sleep(FMT_SPIN_SLEEP);
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");   // the observing lane synchronizes-with the release
+            }
+            FMT_TSP(2);
+            __syncthreads();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+            #pragma unroll
+            for (int r = 0; r < BLOCK_M; ++r) {
+                const float t = (m0 + r < M) ? __builtin_bit_cast(float, __hip_atomic_load(reinterpret_cast<const int*>(&A.tau[m0 + r]),
+                                                                                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) : 0.f;
+                if (hset == (r & 1)) p_tau[r / 2] = t;
+            }
         }
     }
     __syncthreads();
@@ -529,7 +797,8 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
         bool last = true;
         if (SplitN > 1) {
             if (tid == 0) {
-                const int old = __hip_atomic_fetch_add(&A.block_done[bx], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+                FMT_RELEASE_AGENT();
+                const int old = __hip_atomic_fetch_add(&A.block_done[bx], 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
                 const int lst = (old == SplitN - 1);
                 if (lst) A.block_done[bx] = 0;          // self-reset for the next launch
                 bcast = lst;
@@ -560,10 +829,10 @@ __device__ __forceinline__ void fused_item_body(const FusedArgs& A, const int bx
 
 template <bool FUSE_SELECT>
 __device__ __noinline__ void fused_item_call(const FusedArgs& A, const int bx, const int s, const int slot) {
-    fused_item_body<FUSE_SELECT, true>(A, bx, s, slot);
+    fused_item_body<FUSE_SELECT, true, false>(A, bx, s, slot);
 }
 
-template <bool FUSE_SELECT, bool PERSIST, bool REVERSE_ROWS>
+template <bool FUSE_SELECT, bool PERSIST, bool REVERSE_ROWS, bool DIST = false>
 __global__ __launch_bounds__(FUSED_THREADS)
 void fused_kernel(FusedArgs A)
 {
@@ -581,7 +850,7 @@ void fused_kernel(FusedArgs A)
             if (blockIdx.x == 0 && blockIdx.y == 0 && tid == 0) *A.fbc = 0;   // the separate select appends later
         }
         if (bx * ROWS_WG >= M) return;
-        fused_item_body<FUSE_SELECT, false>(A, bx, blockIdx.y, 0);
+        fused_item_body<FUSE_SELECT, false, DIST>(A, bx, blockIdx.y, 0);
     } else {
         // ---- persistent: claim (row block, split) items from a global counter ----
         const int G = gridDim.x, wg = blockIdx.x;
@@ -601,7 +870,8 @@ void fused_kernel(FusedArgs A)
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");   // every wave's fallback-list stores complete (do not rely
         __syncthreads();                                    // on the wait at the return of the noinline item call)
         if (tid == 0) {
-            __hip_atomic_fetch_add(&A.ctr[1], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+            FMT_RELEASE_AGENT();
+            __hip_atomic_fetch_add(&A.ctr[1], 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
             while (__hip_atomic_load(&A.ctr[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < G) __builtin_amdgcn_s_sleep(FMT_SPIN_SLEEP);
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         }
@@ -636,7 +906,8 @@ void fused_kernel(FusedArgs A)
 #endif
         // ---- the last WG out resets the counters for the next launch ----
         if (tid == 0) {
-            const int old = __hip_atomic_fetch_add(&A.ctr[3], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+            FMT_RELEASE_AGENT();
+            const int old = __hip_atomic_fetch_add(&A.ctr[3], 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
             if (old == G - 1) { A.ctr[0] = 0; A.ctr[1] = 0; A.ctr[2] = 0; A.ctr[3] = 0; *A.fbc = 0; }
         }
     }

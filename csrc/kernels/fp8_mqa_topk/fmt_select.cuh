@@ -214,15 +214,16 @@ constexpr int TAU_STREAM_T = 8, TAU_STREAM_B = 16;
 // tau of up to NR rows of one wave in LOCKSTEP, so their load and LDS latency chains overlap (4 rows one after another
 // were latency-bound: 29 us per 32-row block at 896 samples/row, 116 us at 8192). Row q: act[q] (false -> -inf),
 // tgt[q] target rank (<= 16 T), samples in nseg segments: cntf(q, g) = wave-uniform count, ld(q, g, i) = value i.
-// 1) every lane keeps its T largest keys per row; segment elements are dealt to lanes round-robin over the
-//    concatenation (lane = (prefix + i) % 64), so lanes stay balanced and a row with <= 64 T samples keeps them all;
+// 1) every lane keeps its T largest keys per row; BAL: segment elements are dealt to lanes round-robin over the
+//    concatenation (lane = (prefix + i) % 64), so lanes stay balanced and a row with <= 64 T samples keeps them all
+//    (!BAL: lane = i % 64 in every segment - fewer registers; the kept-count check below still guards the result);
 //    the kept keys are a subset of the samples, so the result is <= the exact target-th largest (valid lower bound);
 // 2) the relative two-pass radix of wave_tau_relradix on the NR rows together (LDS: NR x 256 u32 at hist, 16 B aligned).
 // A row whose kept-key count is below its target (cannot happen with balanced dealing) gets tau = -inf (safe).
-template <int NR, int B, typename CNT>
+template <int NR, int B, bool BAL = true, typename CNT>
 __device__ __forceinline__ void wave_tau_multi(const uint32_t* const (&rowp)[NR], int64_t seg_stride, CNT&& cntf, int nseg,
                                                const bool (&act)[NR], const int (&tgt)[NR], uint32_t* hist, int lane,
-                                               float (&tau)[NR]) {
+                                               float (&tau)[NR], int* dbg_kept = nullptr) {
     // rowp[q]: wave-uniform base of row q's sample records in segment 0 (record i's fp32 bits at rowp[q][4 i], i.e.
     // u64 records at a 16-byte stride); segment g starts seg_stride u32 later. Loads past a row's count are masked, not
     // clamped (uniform base + 32-bit lane offset + immediate: one VGPR per row and round), so the record buffer needs
@@ -243,7 +244,7 @@ __device__ __forceinline__ void wave_tau_multi(const uint32_t* const (&rowp)[NR]
         #pragma unroll
         for (int q = 0; q < NR; ++q) {
             n[q] = act[q] ? cntf(q, g) : 0;
-            off[q] = (lane - pref[q]) & (WARP - 1);          // this lane's first element of the segment
+            off[q] = BAL ? ((lane - pref[q]) & (WARP - 1)) : lane;   // this lane's first element of the segment
             nmax = max(nmax, n[q]);
             sp[q] = rowp[q] + (int64_t)g * seg_stride;
         }
@@ -328,6 +329,7 @@ __device__ __forceinline__ void wave_tau_multi(const uint32_t* const (&rowp)[NR]
         const bool flat = kmax[q] == kmin[q];
         const uint32_t key = flat ? kmax[q] : Tf;
         tau[q] = (act[q] && kept[q] >= tgt[q]) ? __builtin_bit_cast(float, okey32_inv(key)) : -__builtin_huge_valf();
+        if (dbg_kept) dbg_kept[q] = kept[q];
     }
     mem_fence_wave();
 }
@@ -841,7 +843,7 @@ __global__ __launch_bounds__(256) void fallback1_kernel(const int* __restrict__ 
             }
         }
         int old = 0;
-        if (lane == 0) old = __hip_atomic_fetch_add(&done[ord], mine, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (lane == 0) { FMT_RELEASE_AGENT(); old = __hip_atomic_fetch_add(&done[ord], mine, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT); }
         old = __shfl(old, 0);
         if (old + mine == nb) {                 // this wave completed the row: every slice is visible (acquire)
             if (nfb && lane == 0) atomicAdd(nfb, 1);
@@ -872,7 +874,8 @@ __global__ __launch_bounds__(256) void fallback1_kernel(const int* __restrict__ 
     if (fb_exit) {
         __syncthreads();
         if (threadIdx.x == 0) {
-            const int old = __hip_atomic_fetch_add(fb_exit, 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+            FMT_RELEASE_AGENT();
+            const int old = __hip_atomic_fetch_add(fb_exit, 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
             if (old == (int)gridDim.x - 1) { *const_cast<int*>(fbc) = 0; *fb_exit = 0; }
         }
     }

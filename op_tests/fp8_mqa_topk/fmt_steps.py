@@ -25,9 +25,10 @@ def lib():
             "fmt_sample_tau": [c_vp] * 7 + [c_int] * 5 + [c_vp, c_vp, c_vp],
             "fmt_select1": [c_vp, c_vp, c_int, c_int, c_vp, c_vp, c_int, c_int, c_int] + [c_vp] * 11,
             "fmt_fused_nsb": [c_int, c_int, c_int],
-            "fmt_step2": [c_vp] * 6 + [c_int] * 8 + [c_vp] * 5 + [c_int] + [c_vp] * 6 + [c_int, c_vp],
-            "fmt_step3": [c_vp] * 6 + [c_int] * 8 + [c_vp] * 5 + [c_int] + [c_vp] * 8 + [c_int, c_vp],
-            "fmt_step4": [c_vp] * 6 + [c_int] * 8 + [c_vp] * 5 + [c_int] + [c_vp] * 7 + [c_int, c_vp],
+            "fmt_fused_nsbc": [c_int, c_int, c_int],
+            "fmt_step2": [c_vp] * 6 + [c_int] * 8 + [c_vp] * 5 + [c_int] + [c_vp] * 6 + [c_int, c_int] + [c_vp] * 4,
+            "fmt_step3": [c_vp] * 6 + [c_int] * 8 + [c_vp] * 5 + [c_int] + [c_vp] * 8 + [c_int, c_int] + [c_vp] * 4,
+            "fmt_step4": [c_vp] * 6 + [c_int] * 8 + [c_vp] * 5 + [c_int] + [c_vp] * 7 + [c_int, c_int] + [c_vp] * 4,
         }
         for name, args in sig.items():
             fn = getattr(L, name)
@@ -138,18 +139,29 @@ class Step2:
     name = "step2"
     NAME = "fmt_step2"
 
-    def __init__(self, S=32, cap=4096, K=F.TOPK):
+    def __init__(self, S=32, cap=4096, K=F.TOPK, split=None):
         self.S, self.cap, self.K = S, cap, K
+        self.split_override = split   # test hook: force SplitN (grids larger than the GPU exercise chunk stealing)
+        self.dbg_bits = 0             # extra kernel dbg bits (8: DIST variant for any SplitN > 1, 16: chunk per split)
         self.shape = None
         self.force_fallback = False
 
     def prep(self, M, N):
         d = "cuda"
         self.split, self.rev = choice(M, N)
+        if self.split_override:
+            self.split = self.split_override
         self.nsb = lib().fmt_fused_nsb(N, self.split, self.S)
         self.rb = (M + 31) // 32
         Mp = M + (M & 1)
-        self.smp = torch.empty(Mp * self.nsb + SMP_SLACK, dtype=torch.int64, device=d)
+        # SplitN > 1: distributed sampling, one [Mp][nsbc] segment per chunk (= split); else rows of nsb records
+        self.nsbc = lib().fmt_fused_nsbc(N, self.split, self.S) if self.split > 1 else 0
+        # (SplitN > 1 uses one whole-range chunk of nsb records when the grid does not fit on the GPU)
+        nrec = max(self.split * Mp * self.nsbc, Mp * self.nsb) if self.split > 1 else Mp * self.nsb
+        self.smp = torch.empty(nrec + SMP_SLACK, dtype=torch.int64, device=d)
+        self.sflag = torch.zeros(2 * self.rb * self.split, dtype=torch.int32, device=d)   # epoch-valued, zeroed once
+        self.scnt = torch.empty(self.split * M, dtype=torch.int32, device=d)
+        self.tflag = torch.zeros(2 * self.rb * 32, dtype=torch.int32, device=d)
         self.tau = torch.empty(M, device=d)
         self.tau_ready = torch.zeros(self.rb, dtype=torch.int32, device=d)
         self.epoch = 0
@@ -169,10 +181,15 @@ class Step2:
         L, p, st = lib(), F.ptr, F.stream()
         _ck(L.fmt_step2(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), M, N, self.split, self.rev, self.S, self.K, self.cap,
                         self.nsb, p(self.smp), p(self.cand), p(self.cnt), p(self.tau), p(self.tau_ready), self._ep(), p(out),
-                        p(self.flag), p(self.fbc), p(self.done), p(self.scratch), nfb, int(self.force_fallback), st), self.NAME)
+                        p(self.flag), p(self.fbc), p(self.done), p(self.scratch), nfb, int(self.force_fallback) | self.dbg_bits, self.nsbc,
+                        p(self.sflag), p(self.scnt), p(self.tflag), st), self.NAME)
 
     def _ep(self):
-        self.epoch = self.epoch % 2000000000 + 1
+        if self.epoch >= 2000000000:   # wrap: flags of old launches must not match a reused epoch
+            self.epoch = 0
+            for t in (self.sflag, self.tflag, self.tau_ready):
+                t.zero_()
+        self.epoch += 1
         return self.epoch
 
     def __call__(self, q8, k8, sc, w, ks, ke, out, count_fb=False):
@@ -198,7 +215,7 @@ class Step3(Step2):
         _ck(L.fmt_step3(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), M, N, self.split, self.rev, self.S, self.K, self.cap,
                         self.nsb, p(self.smp), p(self.cand), p(self.cnt), p(self.tau), p(self.tau_ready), self._ep(), p(out),
                         p(self.flag), p(self.fbc), p(self.block_done), p(self.done), p(self.fb_exit), p(self.scratch), nfb,
-                        int(self.force_fallback), st), self.NAME)
+                        int(self.force_fallback) | self.dbg_bits, self.nsbc, p(self.sflag), p(self.scnt), p(self.tflag), st), self.NAME)
 
 
 class Step4(Step2):
@@ -211,6 +228,7 @@ class Step4(Step2):
     def prep(self, M, N):
         super().prep(M, N)
         d = "cuda"
+        # the persistent kernel always runs the split-0 (non-distributed) variant: per-WG sample slots of nsb records
         self.smp = torch.empty(self.G * 32 * self.nsb + SMP_SLACK, dtype=torch.int64, device=d)
         self.ctr = torch.zeros(4, dtype=torch.int32, device=d)
         self.fscratch = torch.empty(self.G * N, device=d)
@@ -221,4 +239,4 @@ class Step4(Step2):
         _ck(L.fmt_step4(p(q8), p(k8), p(sc), p(w), p(ks), p(ke), M, N, self.split, self.S, self.K, self.cap, self.nsb,
                         self.G, p(self.smp), p(self.cand), p(self.cnt), p(self.tau), p(self.tau_ready), self._ep(), p(out),
                         p(self.flag), p(self.fbc), p(self.block_done), p(self.ctr), p(self.fscratch), nfb,
-                        int(self.force_fallback), st), self.NAME)
+                        int(self.force_fallback) | self.dbg_bits, self.nsbc, p(self.sflag), p(self.scnt), p(self.tflag), st), self.NAME)

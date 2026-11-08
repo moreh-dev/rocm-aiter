@@ -68,6 +68,12 @@ __device__ __forceinline__ int wave_incl_scan(int x, int lane) {
     return x;
 }
 __device__ __forceinline__ void mem_fence_wave() { asm volatile("" ::: "memory"); }
+// Agent-scope release written out by hand, issued by the lane that then stores / RMWs the flag: this wave's memory ops
+// complete, the XCD L2 is written back (covering the other waves' stores that completed before the WG barrier), and
+// the writeback completes. The compiler's own release sequence (buffer_wbl2 sc1; s_waitcnt vmcnt(0); store) loses
+// the second wait whenever SIInsertWaitcnts' scoreboard is empty - it does not count buffer_wbl2 (seen in two release
+// sites of a gfx950 build; LLVM fixed it upstream) - and inline asm cannot be removed. tools/wbl2check.py checks the ISA.
+#define FMT_RELEASE_AGENT() asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\tbuffer_wbl2 sc1\n\ts_waitcnt vmcnt(0)" ::: "memory")
 
 // Loads of data written earlier IN THIS KERNEL (by this or another workgroup): relaxed atomic loads at agent scope,
 // which gfx94x/gfx950 lower to global_load ... sc1 (not served from a possibly stale vector-L1 line). Cross-XCD
