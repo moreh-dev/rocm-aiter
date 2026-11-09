@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the fused pipelines against the references, 1 layer, top-512, per vLLM chunk of 16,384 tokens.
+"""Benchmark the fused pipelines against the references, 1 layer, top-512, per prefill chunk (default 16,384 tokens).
 
   python3 bench.py --isl 8192,60000,128000 --paths baseu,hi16u,fuse48,step0 [--shapes 16384x32000,...]
 
@@ -15,6 +15,7 @@ import fmt_steps as S
 PATHS = {
     "baseu": lambda: F.BaseU(),
     "hi16u": lambda: F.Hi16U(),
+    "pr16": lambda: F.PR16(),        # moreh-dev/rocm-aiter PR #16 (fp8_mqa_logits_topk, 16-bit logits + top-K)
     "fuse48": lambda: F.Fuse48(),
     "step0": lambda: S.Step0(),
     "step1": lambda: S.Step1(),
@@ -22,6 +23,8 @@ PATHS = {
     "step0ks32": lambda: S.Step0(S=32, krule=True),   # step 0 with the step 2-4 tau = -inf rule (nvalid <= K)
     "step1s32": lambda: S.Step1(S=32),
     "step2": lambda: S.Step2(S=32),
+    "step0ks32sp1": lambda: S.Step0(S=32, krule=True, split=1),   # grid-model diagnostics: SplitN forced to 1
+    "step2sp1": lambda: S.Step2(S=32, split=1),
     "step3": lambda: S.Step3(S=32),
     "step4": lambda: S.Step4(S=32),
 }
@@ -31,6 +34,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--isl", default="8192,60000,128000")
     ap.add_argument("--shapes", default="", help="explicit MxN chunks instead of --isl")
+    ap.add_argument("--chunk", type=int, default=F.CHUNK, help="prefill chunk (tokens) for --isl")
     ap.add_argument("--paths", default="baseu,hi16u,fuse48,step0")
     ap.add_argument("--kind", default="rand")
     ap.add_argument("--reqs", type=int, default=1)
@@ -44,7 +48,7 @@ def main():
     if a.shapes:
         plan = [(s, [tuple(map(int, s.split("x")))]) for s in a.shapes.split(",")]
     else:
-        plan = [(str(L), F.chunks(L)) for L in map(int, a.isl.split(","))]
+        plan = [(str(L), F.chunks(L, chunk=a.chunk)) for L in map(int, a.isl.split(","))]
     cache, res = {}, {"args": vars(a), "chunks": {}, "isl": {}}
     for name, cl in plan:
         for (M, N) in cl:

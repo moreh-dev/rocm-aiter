@@ -62,8 +62,9 @@ class Step0:
     EMIT scan (row-wide tau, v35wes split), select + 3 fallback kernels. 7 kernels + 6 torch ops per call."""
     name = "step0"
 
-    def __init__(self, S=16, cap=4096, K=F.TOPK, krule=False):
+    def __init__(self, S=16, cap=4096, K=F.TOPK, krule=False, split=None):
         self.S, self.cap, self.K = S, cap, K
+        self.split_override = split   # test hook: force the EMIT scan's SplitN
         # tau = -inf rule: rows with nvalid <= rule get every key as a candidate. Steps 0/1 use CAP; krule=True uses K
         # (the step 2-4 rule) for a like-for-like comparison.
         self.rule = K if krule else cap
@@ -73,6 +74,8 @@ class Step0:
     def prep(self, M, N):
         d = "cuda"
         self.split, self.rev = choice(M, N)
+        if self.split_override:
+            self.split = self.split_override
         self.Ns = (N + self.S - 1) // self.S
         self.ls = torch.empty(M, self.Ns, device=d)
         self.tau = torch.empty(M, device=d)

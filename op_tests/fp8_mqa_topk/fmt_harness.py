@@ -207,6 +207,24 @@ class BaseU:
         self.vops.top_k_per_row_prefill(lg, ks, ke, out, M, N, 1, out.shape[1])
 
 
+class PR16:
+    """moreh-dev/rocm-aiter PR #16 (namle, 90fb19697): aiter.ops.fp8_mqa_logits_topk = the v35wes logits stored as their
+    high 16 bits ([M, N] 2-byte keys) + a two-pass top-K over them, keys tied at the K-th recomputed in fp32. Built in
+    its own tree (PR untouched) and loaded by path, so this harness keeps the branch's aiter."""
+    name = "pr16"
+    SO = os.environ.get("FMT_PR16_SO", "/workspace/workspace/rocm-aiter-pr16/aiter/jit/module_fp8_mqa_logits_topk.so")
+
+    def __init__(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("module_fp8_mqa_logits_topk", self.SO)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.fn = mod.fp8_mqa_logits_topk
+
+    def __call__(self, q8, k8, sc, w, ks, ke, out):
+        self.fn(q8, k8, sc, w, ks, ke, out, 256)
+
+
 def _ref_import():
     if REF_DIR not in sys.path:
         sys.path.insert(0, REF_DIR)

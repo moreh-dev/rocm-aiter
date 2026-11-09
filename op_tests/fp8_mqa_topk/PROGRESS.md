@@ -471,3 +471,36 @@ Long context and small M (`results/bench_long_shapes_fixed.json`):
   * The distributed variant's scan loop carries more register pressure (+1.5 % VALU, SGPR-spill reloads), and it
     keeps u64 sample records (the value-only flavour there made the allocator copy / spill in-flight prefetch
     registers).
+
+## 2026-11-09 - comparison with moreh-dev/rocm-aiter PR #16 (`fp8_mqa_logits_topk`)
+
+PR #16 (namle, 90fb19697 on main 269675dea) is the hi16 design as an aiter op: v35wes logits stored as their high 16
+bits (`[M, N]` 2-byte keys, half of baseu's bytes), a two-pass top-K over them, keys tied at the K-th recomputed in
+fp32. It was built untouched from a worktree (`workspace/rocm-aiter-pr16`, local branch `tmp/pr16-compare` = the PR
+commit, its own aiter JIT, CK from this tree: same submodule pin) and loaded by path as bench path `pr16`.
+Same harness, data, GPU and timing as the m11 runs. Every path has 0 wrong rows on every chunk (exact top-K of the
+v35wes logits), PR #16 included.
+
+| ms, 1 layer, top-512 | baseu | PR #16 | step0ks32 | step2 | step2 vs PR #16 |
+|---|---|---|---|---|---|
+| ISL 128K, 16384-token chunks | 10.937 | 8.926 | 8.471 | **8.232** | -7.8 % (step 0 -5.1 %) |
+| ISL 128K, 8192-token chunks | 10.775 | 9.249 | 9.435 | **9.173** | -0.8 % (step 0 +2.0 %) |
+| 16384 x 65536 | 4.854 | 4.100 | 3.655 | **3.611** | -11.9 % |
+| 16384 x 262144 | 19.050 | 18.679 | **14.119** | 14.167 | -24.2 % |
+| 13312 x 32000 | 1.987 | 1.594 | 1.590 | **1.573** | -1.3 % |
+| 4096 x 131072 | 2.490 | 2.218 | **1.873** | 1.894 | -14.6 % |
+| 2048 x 131072 | 1.293 | 1.139 | **0.969** | 1.027 | -9.9 % |
+| 576 x 250000 | 0.756 | 0.659 | **0.564** | 0.622 | -5.7 % |
+
+(`results/pr16_128k_c16k.json` with hi16u 8.986 = PR #16 within 0.7 %, `results/pr16_128k_c8k.json`,
+`results/pr16_long.json`.)
+
+* PR #16 still writes and re-reads an `[M, N]` matrix, so it falls behind as N grows (-2 % vs baseu at 262K pools);
+  the fused paths cost N/32 + the scan. It is ahead on short rows: 8192 x 2048 0.104 ms vs 0.152 (step 2) / 0.163
+  (step 0), and on the 8192-row chunks up to ~16K pools. Its one outlier: 8192 x 4096 0.273 ms (slower than its
+  8192 x 6144, 0.267; reproduced).
+* 8192-token chunks are where the grid model hurts steps 0/2: it gives every 8192-row chunk SplitN 2 (and the
+  5120-row tail chunk 8), so step 2's other split waits for split 0's sample + tau. Forcing SplitN 1 on those chunks
+  (`step2sp1` / `step0ks32sp1`, `results/pr16_128k_c8k_split1.json`): step 2 8.835 ms (-4.5 % vs PR #16, faster on
+  every chunk from 6K pools up), step 0 9.243 (= PR #16); the 5120 x 32000 tail still prefers SplitN 8. The model
+  prices only the scan, not the step-2 tau hand-off.
