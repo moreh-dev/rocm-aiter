@@ -7,7 +7,10 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from aiter.ops.triton.attention.kda import fused_recurrent_kda
+from aiter.ops.triton.attention.kda import (
+    fused_recurrent_kda,
+    fused_recurrent_kda_packed_decode,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
@@ -23,6 +26,12 @@ except ImportError:
 BACKENDS = {
     "gluon": "aiter gluon",
     "fla": "fla triton",
+}
+
+# --fold_gates lines: the packed one-token decode with and without the gate fold.
+GATE_FOLD_LINES = {
+    "gates": "gate GEMMs + gluon",
+    "fold": "gluon gate fold",
 }
 
 K3_HEAD_DIM = 128
@@ -115,6 +124,56 @@ def make_inputs(
         "num_accepted_tokens": accepted,
         **extra,
     }
+
+
+def make_gate_fold_fn(provider, B, H, D, dtype, device, state_dtype, W=4):
+    """Packed one-token decode. ``gates`` runs the two gate GEMMs, ``fold`` folds them."""
+    lp = H * D
+    # One projection output has q|k|v, the gate inputs and beta as strided views.
+    projected = torch.randn(B, 3 * lp + 2 * D + H, dtype=dtype, device=device)
+    mixed, gate_in, out_gate_in, beta = projected.split([3 * lp, D, D, H], dim=-1)
+    gate_weight = torch.randn(lp, D, dtype=dtype, device=device) * D**-0.5
+    out_gate_weight = torch.randn(lp, D, dtype=dtype, device=device) * D**-0.5
+    conv_state = torch.randn(B + 1, W - 1, 3 * lp, dtype=dtype, device=device)
+    shared = {
+        "mixed_qkv": mixed,
+        "beta": beta,
+        "A_log": torch.log(
+            torch.empty(H, dtype=torch.float32, device=device).uniform_(1, 16)
+        ),
+        "dt_bias": torch.randn(lp, dtype=torch.float32, device=device),
+        "lower_bound": K3_LOWER_BOUND,
+        # Slot 0 is the pad slot of the packed decode.
+        "initial_state": torch.randn(B + 1, H, D, D, dtype=state_dtype, device=device),
+        "ssm_state_indices": torch.arange(1, B + 1, dtype=torch.int32, device=device),
+        "conv_state": conv_state.transpose(-1, -2),
+        "conv_weight": torch.randn(3, W, lp, dtype=torch.float32, device=device) * 0.1,
+        "norm_weight": torch.rand(D, dtype=torch.float32, device=device) + 0.5,
+        "norm_eps": 1e-5,
+        "out": torch.empty(B, H, D, dtype=dtype, device=device),
+    }
+
+    if provider == "fold":
+
+        def fn():
+            fused_recurrent_kda_packed_decode(
+                g=None,
+                out_gate=None,
+                gate_in=gate_in,
+                gate_weight=gate_weight,
+                out_gate_in=out_gate_in,
+                out_gate_weight=out_gate_weight,
+                **shared,
+            )
+
+    else:
+
+        def fn():
+            g = F.linear(gate_in, gate_weight).view(B, H, D)
+            og = F.linear(out_gate_in, out_gate_weight).view(B, H, D)
+            fused_recurrent_kda_packed_decode(g=g, out_gate=og, **shared)
+
+    return fn
 
 
 def traffic_bytes(
@@ -219,14 +278,15 @@ def benchmark(args):
     state_dtype = torch.bfloat16 if args.state_dtype == "bf16" else torch.float32
     D = args.head_dim
 
-    line_vals = []
-    for b in args.backends:
+    line_vals = list(GATE_FOLD_LINES) if args.fold_gates else []
+    for b in [] if args.fold_gates else args.backends:
         if b == "gluon":
             line_vals += gluon_lines(args)
         elif b != "fla" or HAS_FLA:
             line_vals.append(b)
+    names = {**BACKENDS, **GATE_FOLD_LINES}
     line_names = [
-        f"gluon BV{v.split(':')[1]}" if v.startswith("gluon:") else BACKENDS[v]
+        f"gluon BV{v.split(':')[1]}" if v.startswith("gluon:") else names[v]
         for v in line_vals
     ]
 
@@ -251,9 +311,24 @@ def benchmark(args):
 
     spread = {}
 
+    def measure(fn, mem, key):
+        runs = [_time(fn, args) for _ in range(args.runs)]
+        med = sorted(r[0] for r in runs)[len(runs) // 2]
+        lo, hi = min(r[1] for r in runs), max(r[2] for r in runs)
+        best, worst = min(r[0] for r in runs), max(r[0] for r in runs)
+        spread[key] = (best, med, worst, lo, hi)
+
+        ms = best if args.reduce == "best" else med
+        if args.metric == "time":
+            return ms * 1e3, lo * 1e3, hi * 1e3
+        return mem / ms * 1e-9, mem / hi * 1e-9, mem / lo * 1e-9
+
     @triton.testing.perf_report(configs)
     def bench_kda(H, B, T, provider):
         torch.manual_seed(0)
+        if provider in GATE_FOLD_LINES:
+            fn = make_gate_fold_fn(provider, B, H, D, dtype, args.device, state_dtype)
+            return measure(fn, 0, (H, B, T, provider))
         inputs = make_inputs(
             B,
             T,
@@ -316,16 +391,7 @@ def benchmark(args):
             def fn():
                 fla_kda(**shared)
 
-        runs = [_time(fn, args) for _ in range(args.runs)]
-        med = sorted(r[0] for r in runs)[len(runs) // 2]
-        lo, hi = min(r[1] for r in runs), max(r[2] for r in runs)
-        best, worst = min(r[0] for r in runs), max(r[0] for r in runs)
-        spread[(H, B, T, provider)] = (best, med, worst, lo, hi)
-
-        ms = best if args.reduce == "best" else med
-        if args.metric == "time":
-            return ms * 1e3, lo * 1e3, hi * 1e3
-        return mem / ms * 1e-9, mem / hi * 1e-9, mem / lo * 1e-9
+        return measure(fn, mem, (H, B, T, provider))
 
     bench_kda.run(save_path="." if args.o else None, print_data=True, show_plots=False)
     report_spread(spread, line_vals, line_names, args)
@@ -427,6 +493,13 @@ def parse_args():
     parser.add_argument("--paged", action="store_true", default=False)
     parser.add_argument("--fused", action="store_true", default=False)
     parser.add_argument(
+        "--fold_gates",
+        action="store_true",
+        default=False,
+        help="gfx950: time the packed one-token decode with the gate fold and with "
+        "the two gate GEMMs before the kernel. Reports the time in us.",
+    )
+    parser.add_argument(
         "--backends",
         type=str,
         nargs="+",
@@ -489,6 +562,10 @@ def parse_args():
 def run_bench(args):
     if arch_info.get_arch() not in ("gfx950", "gfx1250"):
         sys.exit(f"KDA gluon decode needs gfx950/gfx1250, got {arch_info.get_arch()}")
+    if args.fold_gates:
+        if arch_info.get_arch() != "gfx950":
+            sys.exit(f"--fold_gates needs gfx950, got {arch_info.get_arch()}")
+        args.seq_lens, args.metric = [1], "time"
     if args.gluon_configs is None:
         # The gfx950 kernel holds the whole [V, K] state: BV == V.
         gfx950 = arch_info.get_arch() == "gfx950"
