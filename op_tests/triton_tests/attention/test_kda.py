@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from aiter.ops.triton.attention.kda import (
     fused_recurrent_kda,
     fused_recurrent_kda_packed_decode,
+    is_gate_fold_supported,
 )
 from aiter.ops.triton.utils import config_utils as triton_core
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -1995,6 +1996,7 @@ def test_fused_recurrent_kda_packed_decode_gate_fold_steps():
 @gfx950_only
 def test_gate_fold_guards():
     N, H, D = 2, 8, 128
+    assert is_gate_fold_supported(D) and not is_gate_fold_supported(64)
     inp = _gate_fold_inputs(N, H)
     out = torch.empty(N, H, D, dtype=torch.bfloat16, device=DEVICE)
     gate = torch.zeros(N, H, D, dtype=torch.bfloat16, device=DEVICE)
@@ -2054,6 +2056,7 @@ def test_gate_fold_guards():
 @gfx1250_only
 def test_gate_fold_requires_gfx950():
     N, H = 2, 8
+    assert not is_gate_fold_supported(128)
     out = torch.empty(N, H, 128, dtype=torch.bfloat16, device=DEVICE)
     with pytest.raises(ValueError, match="gfx950"):
         _packed_decode(_gate_fold_inputs(N, H), out, True)

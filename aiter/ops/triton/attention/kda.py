@@ -28,6 +28,21 @@ elif _ARCH == "gfx950":
     )
 
 
+def is_gate_fold_supported(K: int) -> bool:
+    """Tell if ``fused_recurrent_kda`` can fold the gate projections.
+
+    Only the gfx950 kernel has the gate fold, and it needs ``K == 128``. A caller
+    uses the two gate GEMMs and ``g`` / ``out_gate`` when the result is False.
+
+    Args:
+        K: head dimension of q and k.
+
+    Returns:
+        True when the device and ``K`` support the gate fold arguments.
+    """
+    return _ARCH == "gfx950" and K == 128
+
+
 def fused_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -114,7 +129,9 @@ def fused_recurrent_kda(
             are [HV * K, K] (out x in) and contiguous. All four have the
             dtype of ``q``. Limits: T == 1, K == 128, ``conv_state`` and
             ``norm_weight`` set, ``use_gate_in_kernel``, no ``cu_seqlens``, no
-            ``num_accepted_tokens``, no ``cache_state_updates``.
+            ``num_accepted_tokens``, no ``cache_state_updates``. See
+            ``is_gate_fold_supported``. With 64 heads and 16 or more sequences,
+            the fold is slower than the two gate GEMMs.
 
     Returns:
         (o, final_state): o is [B, T, HV, V] in v's dtype. final_state is
