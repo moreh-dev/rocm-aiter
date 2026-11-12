@@ -2928,3 +2928,17 @@ namespace py = pybind11;
           py::arg("unroll2")      = -1,                \
           py::arg("reverse_rows") = -1,                \
           py::arg("out")          = std::nullopt);
+
+#define FP8_MQA_TOPK_PYBIND                            \
+    m.def("fp8_mqa_topk",                              \
+          &fp8_mqa_topk,                               \
+          py::arg("q_fp8"),                            \
+          py::arg("k_fp8"),                            \
+          py::arg("kv_scale"),                         \
+          py::arg("weights"),                          \
+          py::arg("cu_seqlen_ks"),                     \
+          py::arg("cu_seqlen_ke"),                     \
+          py::arg("topk_indices"),                     \
+          py::arg("TotalCuCount")   = 256,             \
+          py::arg("fallback_rows")  = std::nullopt,    \
+          py::arg("force_fallback") = false);
