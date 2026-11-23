@@ -47,7 +47,9 @@ def is_gate_fold_supported(K: int) -> bool:
 # Routed on the public entry: it takes no backend pin, and the gfx950 and
 # gfx1250 Gluon kernels are chosen beneath it. `config` is AITER's tuning dict,
 # a hint a provider may ignore.
-@_route(op="fused_recurrent_kda")
+# Version 2 adds the four gate fold arguments, and `g` and `out_gate` can be None.
+# A v1 provider cannot bind them or read a None gate, so v1 is not superseded.
+@_route(op="fused_recurrent_kda", version=2)
 def fused_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -520,7 +522,8 @@ def fused_recurrent_kda(
 # Routed on its public entry, ahead of fused_recurrent_kda: a provider with a
 # kernel for the packed one-token decode serves it here. When none does, the
 # native body calls fused_recurrent_kda, which a provider is asked about again.
-@_route(op="fused_recurrent_kda_packed_decode")
+# Version 2 adds the four gate fold arguments. See fused_recurrent_kda for v1.
+@_route(op="fused_recurrent_kda_packed_decode", version=2)
 def fused_recurrent_kda_packed_decode(
     mixed_qkv: torch.Tensor,
     g: torch.Tensor | None,
