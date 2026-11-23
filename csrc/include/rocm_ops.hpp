@@ -3169,7 +3169,7 @@ namespace py = pybind11;
 
 #define FP8_MQA_TOPK_PYBIND                         \
     m.def("fp8_mqa_topk",                           \
-          &fp8_mqa_topk,                            \
+          &aiter::fp8_mqa_topk,                     \
           py::arg("q_fp8"),                         \
           py::arg("k_fp8"),                         \
           py::arg("kv_scale"),                      \
@@ -3177,6 +3177,12 @@ namespace py = pybind11;
           py::arg("cu_seqlen_ks"),                  \
           py::arg("cu_seqlen_ke"),                  \
           py::arg("topk_indices"),                  \
+          py::arg("workspace"),                     \
           py::arg("TotalCuCount")   = 256,          \
           py::arg("fallback_rows")  = std::nullopt, \
-          py::arg("force_fallback") = false);
+          py::arg("force_fallback") = false);       \
+    m.def("fp8_mqa_topk_workspace_size",            \
+          &aiter::fp8_mqa_topk_workspace_size,      \
+          py::arg("M"),                             \
+          py::arg("N"),                             \
+          py::arg("TotalCuCount") = 256);
